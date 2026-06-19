@@ -1,5 +1,8 @@
 # Claude Code — power-user setup
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-D97757?style=flat-square&logo=anthropic&logoColor=white)](https://claude.com/claude-code)
+
 An opinionated [Claude Code](https://claude.com/claude-code) configuration built around three ideas:
 
 1. **Persistent, file-based memory** — Claude keeps an indexed set of single-fact memory files plus a per-session conversation log, so each session starts with context instead of re-deriving it.
