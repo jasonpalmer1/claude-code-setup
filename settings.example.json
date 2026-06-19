@@ -1,0 +1,20 @@
+{
+  "model": "opus",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/hooks/index-reminder.sh" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/hooks/session-end-log.sh" }
+        ]
+      }
+    ]
+  }
+}

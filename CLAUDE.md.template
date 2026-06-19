@@ -1,0 +1,57 @@
+# Global Instructions (template)
+
+Private, always-loaded rules for every Claude Code session. This is the "constitution" —
+specifics about *who you are* and *how you work* live in the layered memory system below.
+Replace the `<PLACEHOLDERS>` and delete what doesn't apply.
+
+## Memory system (how it's wired)
+
+Persistent memory: `<MEMORY_DIR>`  (e.g. `~/.claude/projects/<your-id>/memory/`)
+
+- **Index** — `MEMORY.md` is the always-in-context table of contents. One line per memory, under 200 lines. It's how Claude knows what to read.
+- **Memory files** — one fact per file, typed via frontmatter `metadata.type`:
+  - `user` — who you are (role, expertise, preferences)
+  - `feedback` — corrections/guidance on how Claude should work (include the *why* + *how to apply*)
+  - `project` — ongoing work, goals, constraints not derivable from code/git
+  - `reference` — pointers to external resources (URLs, dashboards, API endpoints)
+- **On-demand files** — read only when the task calls for it (decisions, people, tools/APIs). Listed in the index.
+- **Conversation log** — `conversations_index.md` (one line per past session) + `conversations/` (full logs, <30 lines each). Scanned only when prior work is referenced; never bulk-loaded.
+
+Rules: "remember this" → save immediately to the right file. Never duplicate — update existing entries. Absolute dates only (e.g. `2026-06-18`, never "today"). Store *why*, not *what* — never store code patterns, git history, or anything discoverable by reading the project. Keep `MEMORY.md` under 200 lines.
+
+## Model efficiency
+
+Delegate everything that doesn't need top-tier reasoning to the cheapest capable subagent.
+Reserve the expensive model for: ambiguous/strategic questions, architecture & tradeoff
+decisions, complex multi-system debugging, and reviewing subagent output.
+
+- **Mid-tier (e.g. Sonnet):** real code, non-trivial fixes/refactors/features, tests, configs, multi-file synthesis, project maps.
+- **Cheap tier (e.g. Haiku):** broad file searches, mechanical bulk edits, extracting info from many files, filtering output.
+
+Parallelize by default. Don't delegate trivial work (subagent boot ≈ 15–20k tokens).
+
+## Token economy (value per token)
+
+Biggest levers, in order:
+
+- **Context firewall.** Every top-tier turn re-bills the whole conversation, so a bulk read is paid on every later turn, not once. Don't read large files/directories directly into the main context — delegate bulk reading/searching to a cheaper subagent that returns a distilled *conclusion*, not file dumps.
+- **Cache discipline.** Prompt cache TTL ≈ 5 min. Batch independent tool calls into one turn; don't bloat always-loaded files mid-session or trigger denied-retry loops — each cache miss re-bills the whole prefix.
+- **Cheap-first escalation.** Default to the cheapest plausible model and let the top tier *review*; only redo on verified failure.
+- **Verify by stakes.** Cheap adversarial verifiers prevent expensive re-work — scale intensity to the stakes.
+- **Measure.** A SessionEnd hook appends usage to a token ledger; review it (`/tokens`) and tune from data.
+
+## Index-first exploration
+
+Read the project's `CLAUDE.md` and target files directly before spawning agents. When delegating, tell the subagent to read the project's `CLAUDE.md` first — it cuts token usage substantially.
+
+## Workflow discipline
+
+- Use plan mode for non-trivial or multi-step work; confirm the approach before large or hard-to-reverse changes.
+- Every project should have a `CLAUDE.md` at its root (file map, architecture, entry points, tech stack). If you touch a project that lacks one, create it (`/index`).
+- Self-improvement: when you're corrected, capture it as a `feedback` memory so it persists.
+
+## Security
+
+- Review code/dependencies before installing or running them.
+- Secrets live in `.env` files and are never committed or echoed into chat, logs, or memory.
+- Confirm before outward-facing or hard-to-reverse actions.
