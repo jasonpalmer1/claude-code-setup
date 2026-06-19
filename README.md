@@ -1,6 +1,5 @@
 # Claude Code — power-user setup
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-D97757?style=flat-square&logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 
 An opinionated [Claude Code](https://claude.com/claude-code) configuration built around three ideas:
@@ -35,7 +34,3 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
 ## Notes
 
 Built and iterated with Claude Code itself. Nothing here contains secrets or machine-specific data — paths are placeholders.
-
-## License
-
-MIT
