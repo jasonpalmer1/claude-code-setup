@@ -17,6 +17,9 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
   - `/index` — create/update a project's `CLAUDE.md` codebase map
   - `/log` — summarize the current session into a persistent conversation log
   - `/tokens` — review the token ledger and report spend trends
+  - `/ship` — deploy-and-verify a web project, safe by default (preview, never production without an explicit flag + confirmation)
+  - `/standup` — read-only portfolio cockpit: git status of every active project at a glance, with a suggested next action for each
+  - `/new-project` — scaffold a new project matching a set stack convention, end to end (scaffold → codebase map → deploy scripts → first commit)
 - **`hooks/`** — automation:
   - `index-reminder.sh` (PostToolUse) — nudges you to map a project that has no `CLAUDE.md`
   - `session-end-log.sh` (SessionEnd) — auto-summarizes the session (on a cheaper model) and appends a usage row
@@ -30,6 +33,12 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
 3. Merge `settings.example.json` into `~/.claude/settings.json`, editing paths as needed.
 4. Create your memory directory and an empty `MEMORY.md` index inside it.
 5. Search-and-replace the placeholders: `<MEMORY_DIR>` (where memory files live) and adjust the watched project roots in `index-reminder.sh`.
+
+## Why it's built this way
+
+I delegate anything that doesn't need top-tier reasoning to a cheaper model — file searches, mechanical edits, project maps, portfolio scans — and reserve the expensive model for judgment calls and reviewing what the cheaper model produced. Token cost is a first-class constraint here, not an afterthought: batching independent tool calls, avoiding mid-session edits that bust the prompt cache, and logging spend per session with a hook are what make it possible to run several agents without losing track of the bill. Memory is just files, one fact per file, indexed by a single markdown table of contents, because that's a substrate an agent can read, update, and reason about directly, with no database or service to run. It's plain text, it diffs cleanly, and nothing in it goes stale without leaving a trace.
+
+My adversarial viability-proofing workflow for new project ideas lives in its own repo: [go-no-go](https://github.com/jasonpalmer1/go-no-go).
 
 ## Notes
 
