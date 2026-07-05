@@ -13,14 +13,15 @@ Steps:
 
 1. **Detect the project + its deploy method** by reading `package.json` (+ any `wrangler.*`, `next.config.*`, `.github/workflows/`). Three common patterns:
    - **A — npm deploy scripts:** `deploy:preview` / `deploy:prod` already wrap `wrangler pages deploy dist --branch preview|main`. Use them verbatim.
-   - **B — manual wrangler, no script** (e.g. a Next.js site with `output: "export"` → `out/`): build, then `wrangler pages deploy out --project-name <name> --branch preview` (or `--branch main` for prod). ⚠️ Treat any public-facing production site as requiring explicit sign-off before `--prod`.
+   - **B — manual wrangler, no script** (e.g. a Next.js site with `output: "export"` → `out/`): build, then `wrangler pages deploy out --project-name <name> --branch preview` (or `--branch main` for prod). Treat any public-facing production site as requiring explicit sign-off before `--prod`.
    - **C — git push triggers a CF Pages deploy** (Git integration or a GitHub Action on push to `main`). Here **shipping = commit + push.** See step 5.
 
 2. **Build first.** Run the project's `build` script. If the build fails, **abort** — report the error and do not deploy.
 
-3. **Quality gate (before any deploy — preview *and* prod).** A proportionate pre-ship sanity check:
-   - **Build clean** — covered by step 2; a broken build already aborts here. Never deploy a broken build.
-   - **Review the diff.** Run `/code-review` on the working diff (the uncommitted/un-deployed changes) at **low/medium effort** — this is a sanity check, not a full audit.
+3. **Quality gate (before any deploy — preview *and* prod).**
+   - **For `--prod`, public sites, or client-facing apps: run `/preflight` first** (build, secrets, sample-data names, truth scan, mobile-hazard scan, cache-bust, visual test, diff review). PREFLIGHT FAIL = do not deploy.
+   - **Build clean** — covered by step 2; a broken build already aborts here.
+   - **Review the diff.** Run `/code-review` on the working diff (the uncommitted/un-deployed changes) at **low/medium effort** — a sanity check, not a full audit. (Skip if `/preflight` just ran — it already includes this.)
    - **Decision rule.** If the review surfaces **blocking / high-severity** findings, **STOP** — report them and let the user decide whether to proceed; do not deploy. If clean (or only minor findings), continue to deploy. This gate doesn't replace the `--prod` confirmation below — prod still requires `--prod` + explicit sign-off on top of passing the gate.
 
 4. **Deploy to PREVIEW by default** (patterns A/B). Use the project's own script/branch convention. Only on `--prod`: first state exactly what will go live, get an explicit yes, *then* run the prod deploy (branch `main`).
@@ -33,4 +34,4 @@ Steps:
 
 7. **Print the live preview URL** (the deployed `*.pages.dev` URL from wrangler's output, or the production domain on `--prod`) as the last line.
 
-Keep it tight: reuse existing scripts, stop at preview unless told otherwise, and never touch DB migrations or a public site's prod without a clear go-ahead.
+Keep it tight: reuse existing scripts, stop at preview unless told otherwise, run `/preflight` before anything public/client-facing goes to prod, and never touch DB migrations or a public site's prod without a clear go-ahead.

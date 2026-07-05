@@ -7,6 +7,12 @@
         "hooks": [
           { "type": "command", "command": "$HOME/.claude/hooks/index-reminder.sh" }
         ]
+      },
+      {
+        "matcher": "Read|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 $HOME/.claude/hooks/context-firewall.py", "timeout": 10 }
+        ]
       }
     ],
     "SessionEnd": [
