@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""Token ledger: parse a Claude Code session transcript and append a usage row.
+"""Token ledger: parse a Claude Code session transcript and write a usage row.
 
 Pure parsing — no model call, costs nothing to run. Sums tokens per model from
 each assistant message's usage block (including subagent transcripts, which
 live in a sibling directory), estimates cost with the price table below, and
-appends one Markdown table row to token_ledger.md.
+writes one Markdown table row to token_ledger.md per session.
+
+A session that gets resumed and ends again later re-parses its (now longer)
+transcript from scratch and UPDATES its existing row in place (same line,
+fresh cumulative totals) instead of appending a duplicate — anything that
+reads this ledger should be able to assume one row per session id.
+
+The write is atomic (temp file + os.replace) so a crash or kill mid-write
+can't truncate or corrupt the ledger. Failures are caught and appended to
+ERROR_LOG instead of raising, so the SessionEnd hook never blocks on this.
 
 Invoked by the SessionEnd hook with the transcript path on stdin (hook JSON) or
 as argv[1]. Safe to run manually:  token-ledger.py <transcript.jsonl>
 """
-import json, sys, os, glob, datetime
+import json, sys, os, glob, datetime, traceback
 
 # Customize: where to append the usage table. If you use the tiered-memory
 # layout from CLAUDE.md.template, point this at your memory dir instead, e.g.
 # os.path.expanduser("~/.claude/projects/-Users-<you>/memory/token_ledger.md")
 LEDGER = os.path.expanduser("~/.claude/token_ledger.md")
+
+# Where write/parse failures get logged instead of failing silently.
+ERROR_LOG = os.path.expanduser("~/.claude/hub/hook-errors.log")
 
 # $ per million tokens: (input, output, cache_write_5m=1.25x, cache_read=0.1x)
 PRICES = {
@@ -22,6 +34,16 @@ PRICES = {
     "sonnet": (3.00, 15.00, 3.75, 0.30),
     "haiku":  (1.00,  5.00, 1.25, 0.10),
 }
+
+HEADER = [
+    "# Token Ledger\n",
+    "\n",
+    "Per-session usage, appended by the SessionEnd hook (`token-ledger.py`). "
+    "Pure parsing of the transcript — no model call. Review with `/tokens`.\n",
+    "\n",
+    "| Date | Session | Input | Output | CacheWrite | CacheRead | HitRate | Est.Cost | By model |\n",
+    "|------|---------|-------|--------|-----------|-----------|---------|----------|----------|\n",
+]
 
 def tier(model: str):
     m = (model or "").lower()
@@ -65,20 +87,28 @@ def accumulate(path, acc, models):
             a[2] += usage.get("cache_creation_input_tokens", 0) or 0
             a[3] += usage.get("cache_read_input_tokens", 0) or 0
 
-def main():
-    tp = read_transcript_path()
-    if not tp or not os.path.isfile(tp):
-        return
-    # accumulate per tier: [input, output, cache_write, cache_read]
+def log_error(msg):
+    # Best-effort diagnostics — must never itself raise or block the hook.
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG), exist_ok=True)
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(ERROR_LOG, "a") as f:
+            f.write(f"[{ts}] token-ledger.py: {msg}\n")
+    except Exception:
+        pass
+
+def build_row(tp, sid_full):
+    """Re-parse the FULL transcript (+ any subagent transcripts) from scratch.
+    For a resumed session this naturally recomputes cumulative totals across
+    the whole (now longer) history — not just the new increment."""
     acc, models = {}, set()
     accumulate(tp, acc, models)
     # Subagent usage lives in a sibling per-session dir: <session-id>/subagents/*.jsonl
-    sid_full = os.path.basename(tp).replace(".jsonl", "")
     sub_glob = os.path.join(os.path.dirname(tp), sid_full, "subagents", "*.jsonl")
     for sub in sorted(glob.glob(sub_glob)):
         accumulate(sub, acc, models)
     if not acc:
-        return
+        return None
     tot_in = tot_out = tot_cw = tot_cr = cost = 0
     per_tier_cost = {}
     for t, (i, o, cw, cr) in acc.items():
@@ -100,21 +130,43 @@ def main():
         f"| {date} | {sess} | {tot_in:,} | {tot_out:,} | {tot_cw:,} | "
         f"{tot_cr:,} | {hit:.0f}% | ${cost:.2f} | {mix} |\n"
     )
-    new = not os.path.exists(LEDGER)
-    if not new:
-        # dedupe by session id: drop any prior row for this session before appending
+    return sess, row
+
+def write_row(sess, row):
+    """Update the row for `sess` in place if it already exists (same line,
+    refreshed totals); otherwise append a new row. Written atomically via
+    temp file + os.replace so a mid-write failure can't truncate the ledger."""
+    if os.path.exists(LEDGER):
         with open(LEDGER) as f:
-            lines = [l for l in f if f"| {sess} |" not in l]
-        with open(LEDGER, "w") as f:
-            f.writelines(lines)
-    with open(LEDGER, "a") as f:
-        if new:
-            f.write("# Token Ledger\n\n")
-            f.write("Per-session usage, appended by the SessionEnd hook (`token-ledger.py`). "
-                    "Pure parsing of the transcript — no model call. Review with `/tokens`.\n\n")
-            f.write("| Date | Session | Input | Output | CacheWrite | CacheRead | HitRate | Est.Cost | By model |\n")
-            f.write("|------|---------|-------|--------|-----------|-----------|---------|----------|----------|\n")
-        f.write(row)
+            lines = f.readlines()
+        if not lines:
+            lines = list(HEADER)
+    else:
+        lines = list(HEADER)
+    marker = f"| {sess} |"
+    idx = next((i for i, l in enumerate(lines) if marker in l), None)
+    if idx is not None:
+        lines[idx] = row          # resumed/re-ended session — refresh in place
+    else:
+        lines.append(row)         # brand-new session — append
+    tmp = f"{LEDGER}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.writelines(lines)
+    os.replace(tmp, LEDGER)        # atomic on POSIX — never a truncated ledger
+
+def main():
+    tp = read_transcript_path()
+    if not tp or not os.path.isfile(tp):
+        return
+    try:
+        sid_full = os.path.basename(tp).replace(".jsonl", "")
+        built = build_row(tp, sid_full)
+        if built is None:
+            return
+        sess, row = built
+        write_row(sess, row)
+    except Exception:
+        log_error(f"{tp}: {traceback.format_exc(limit=4)}")
 
 if __name__ == "__main__":
     main()

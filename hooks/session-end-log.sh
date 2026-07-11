@@ -17,7 +17,10 @@ except Exception: print('')" 2>/dev/null)
 [ -f "$tp" ] || exit 0
 
 # Token ledger first — pure parsing, free, no model call.
-python3 "$HOME/.claude/hooks/token-ledger.py" "$tp" >/dev/null 2>&1 || true
+# stderr (only reached if token-ledger.py's own internal error handling didn't
+# catch something, e.g. python3 itself missing) goes to hook-errors.log instead
+# of being discarded, so silent failures are diagnosable.
+python3 "$HOME/.claude/hooks/token-ledger.py" "$tp" >/dev/null 2>>"$HOME/.claude/hub/hook-errors.log" || true
 
 # Then the summary on a cheaper model (delegable work).
 CLAUDE_AUTOLOG=1 claude -p "/log Read the just-ended session transcript at $tp and write its summary." \

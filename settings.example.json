@@ -18,7 +18,7 @@
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "$HOME/.claude/hooks/session-end-log.sh" }
+          { "type": "command", "command": "$HOME/.claude/hooks/session-end-log.sh", "timeout": 10 }
         ]
       }
     ]
