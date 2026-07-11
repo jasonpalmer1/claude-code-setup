@@ -84,6 +84,20 @@ Read the project's `CLAUDE.md` and target files directly before spawning agents.
 delegating, tell the subagent to read the project's `CLAUDE.md` first — it cuts token usage
 substantially by avoiding redundant re-exploration.
 
+## Hub mode (one front door) — optional
+
+An interactive session started in `~` (not a project dir) **is the hub** — mission control
+for everything. First action: read `~/.claude/commands/hub.md` and run that protocol: board
+greeting → triage every pasted item (inline vs. background worker with an explicit cheap
+model) → verify → act within your own limits for what needs a check-in first →
+board/memory/log bookkeeping automatically → hygiene autopilot (recognize the right
+`/log`/`/compact`/`/clear` moment from your own history) → ledger autopilot (daily spend
+pulse, unprompted improvement suggestions). Escape hatch: a message starting `inline:` stays
+in this chat. Hub mode does NOT apply to sessions started inside project dirs,
+headless/scheduled runs (their prompts win), or separately-owned sessions. `/hub` arms it
+anywhere. Board: `~/.claude/hub/board.md` — the chat is disposable, the disk is durable. See
+`commands/hub.md` and the "One-Chat Hub" section of the README for the full pattern.
+
 ## Workflow discipline
 
 - Use plan mode for non-trivial or multi-step work; confirm the approach before large or
