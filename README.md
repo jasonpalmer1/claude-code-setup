@@ -15,6 +15,7 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
 
 - **`CLAUDE.md.template`** — global instructions (the "constitution"): the tiered memory-system design, the mechanical delegation rules, token-economy levers, index-first exploration, and workflow + security principles. Sanitized — add your own specifics.
 - **`commands/`** — custom slash commands:
+  - `/hub` — mission-control dispatcher: one chat that triages everything you paste and delegates the rest, with disk-durable state (see "One-Chat Hub" below)
   - `/index` — create/update a project's `CLAUDE.md` codebase map
   - `/log` — summarize the current session into a persistent conversation log
   - `/tokens` — review the token ledger, spend trends, and a delegation-ratio metric
@@ -32,6 +33,7 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
   - `session-end-log.sh` (SessionEnd) — auto-summarizes the session (on a cheaper model) and appends a usage row
   - `token-ledger.py` — parses a session transcript (and its subagents' transcripts) and logs per-model token spend (pure parsing, no model call, costs nothing)
   - `context-firewall.py` (PostToolUse) — nudges the main loop when it's doing bulk direct reads instead of delegating them
+- **`templates/`** — drop-in file skeletons, e.g. `hub-board.md`, the empty board the One-Chat Hub reads and writes (see below).
 - **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review), example `launchd` job definitions, and notes on keeping tool grants narrow.
 - **`settings.example.json`** — how to register the hooks and set defaults.
 
@@ -72,7 +74,38 @@ Two mechanical rules, backed by the context-firewall hook, because prose rules a
 
 ### Second machine
 
-If you run Claude Code from more than one machine on the same account, the config in this repo (or your private fork of it) plus your memory directory can be kept in their own git repo and mirrored onto a second machine: a `SETUP.md` at the repo root that a fresh Claude Code session can follow step-by-step (clone the config over `~/.claude`, verify hooks fire, install anything not tracked in git like screenshot-testing binaries), a whitelist-style `.gitignore` (ignore everything, opt in `CLAUDE.md`/`settings.json`/`commands/`/`hooks/`/`routines/`/the memory tree explicitly, so caches, transcripts, and credentials never get swept in by accident), and username-agnostic paths throughout (`~`/`$HOME`, never a hardcoded home directory) so the same tracked files work under a different username with zero edits. The one machine-specific thing worth calling out: if your harness keys its per-project data directory off the OS username, bridge that with a local, untracked symlink rather than editing tracked paths per machine.
+If you run Claude Code from more than one machine on the same account, the config in this repo (or your private fork of it) plus your memory directory can be kept in their own git repo and mirrored onto a second machine: a `SETUP.md` at the repo root that a fresh Claude Code session can follow step-by-step (clone the config over `~/.claude`, verify hooks fire, install anything not tracked in git like screenshot-testing binaries), a whitelist-style `.gitignore` (ignore everything, opt in `CLAUDE.md`/`settings.json`/`commands/`/`hooks/`/`templates/`/`routines/`/the memory tree explicitly, so caches, transcripts, and credentials never get swept in by accident), and username-agnostic paths throughout (`~`/`$HOME`, never a hardcoded home directory) so the same tracked files work under a different username with zero edits. The one machine-specific thing worth calling out: if your harness keys its per-project data directory off the OS username, bridge that with a local, untracked symlink rather than editing tracked paths per machine.
+
+## One-Chat Hub
+
+Most Claude Code sessions carry a hidden tax: which project to open, whether to resume or start fresh, whether you remembered to log before compacting, whether this transcript has quietly gotten expensive. That's the same handful of decisions paid every single sitting — a session-management tax charged to you instead of the tool.
+
+The Hub is one interactive chat — auto-armed whenever an interactive session starts in `~` instead of inside a project directory — that takes those decisions over. Paste anything into it (a task, a bug, a link, three unrelated asks in one message) and it triages each item independently: answer inline, do it inline, or dispatch it to a background worker with an explicit model tier. It tracks what's running, verifies what comes back, works within your own autonomy limits, and does the bookkeeping (board, memory, log, token ledger) without being asked.
+
+**Disk-durable is the core idea.** None of that state lives in the chat transcript — it lives in a board file, the tiered memory system, each repo's own `CLAUDE.md`, and the token ledger. The chat itself is disposable: clear it, lose it, let it get killed, and nothing is lost, because nothing it knows isn't already written down somewhere a fresh session can read.
+
+### How the pieces fit
+
+- **`commands/hub.md`** — the dispatcher protocol: on-start board greeting, per-item triage rules, dispatch rules (model tier, worker prompt template), what to do when a worker finishes, and two autopilots — hygiene (recognizing the right `/log` / `/compact` / `/clear` moment) and ledger (a daily spend pulse with unprompted tuning suggestions).
+- **`templates/hub-board.md`** — the board itself: three sections (`ACTIVE`, `WAITING ON USER`, `LANDED`), one line per item. This is the disk-durable state the hub reads on every start and writes on every dispatch and completion.
+- **The "Hub mode" section in `CLAUDE.md.template`** — the auto-activation trigger (interactive session, started in `~`, not inside a project dir → this is the hub) and its escape hatch (a message starting `inline:` stays in the current chat, no dispatch).
+- **The `SessionEnd` ledger hook** (`hooks/session-end-log.sh` + `hooks/token-ledger.py`, already in this repo) — feeds the ledger autopilot; without it the hub has no spend data to reason about.
+
+### Setup
+
+1. Copy `commands/hub.md` → `~/.claude/commands/hub.md`.
+2. Copy `templates/hub-board.md` → `~/.claude/hub/board.md` (create the `hub/` directory first).
+3. Merge the "Hub mode" section into your `~/.claude/CLAUDE.md` (already there if you copied the whole `CLAUDE.md.template`).
+4. Fill in your own do-not-touch registry and a routing source (the `<YOUR ROUTING SOURCE>` placeholder in `hub.md`) — wherever you track which project owns what, e.g. an entry in your `MEMORY.md`.
+5. Confirm the `SessionEnd` hook from this repo is wired in `settings.json` — the ledger autopilot has nothing to read without it.
+
+### Optional: Remote Control for phone use
+
+If your harness has a remote-control/mobile mode, wire its arm command and constraints into the "Remote control (phone)" section of `hub.md`: the keystroke, what it requires (an account-based login, the terminal process staying alive), reconnect-after-outage behavior, push-notification setup, and which commands stay terminal-only. Skip this entirely if you only ever drive Claude Code from a terminal — the hub works exactly the same either way.
+
+### Mine your own ledger
+
+The hygiene-autopilot thresholds in `hub.md` are calibrated, not guessed. One real ledger audit found that multi-day resumed sessions carried roughly 98% of all spend, and every cost blowup spanned 3 or more days, while same-day sessions stayed cheap by comparison — the doctrine that falls out, **log-then-clear beats resume**, is the whole hygiene autopilot in one sentence. Once the hub has been running long enough to build up a real `token_ledger.md`, run the same audit on your own data (`/tokens` is a start) and feed what you find back into the thresholds in `hub.md`. The system is meant to tune itself from its own exhaust.
 
 ## Notes
 
