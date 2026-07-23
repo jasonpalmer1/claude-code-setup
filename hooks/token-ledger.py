@@ -30,6 +30,7 @@ ERROR_LOG = os.path.expanduser("~/.claude/hub/hook-errors.log")
 
 # $ per million tokens: (input, output, cache_write_5m=1.25x, cache_read=0.1x)
 PRICES = {
+    "fable":  (10.00, 50.00, 12.50, 1.00),
     "opus":   (5.00, 25.00, 6.25, 0.50),
     "sonnet": (3.00, 15.00, 3.75, 0.30),
     "haiku":  (1.00,  5.00, 1.25, 0.10),

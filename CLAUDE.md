@@ -13,6 +13,7 @@ Power-user harness for Claude Code: mechanical delegation rules (explicit model 
 
 ## Entry Points
 - `README.md` — setup guide and design rationale
+- `ONBOARDING.md` — paste-prompts that make Claude Code perform the install (fresh / merge)
 - `CLAUDE.md.template` — global instructions skeleton (copy to `~/.claude/CLAUDE.md`)
 - `commands/hub.md` — Hub protocol and routing
 - `hooks/context-firewall.py` — nudges away from bulk reads in main loop (PostToolUse)

@@ -11,8 +11,14 @@ An opinionated [Claude Code](https://claude.com/claude-code) configuration built
 
 It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the rest.
 
+**Setting it up for the first time?** Don't install by hand — [`ONBOARDING.md`](ONBOARDING.md)
+has two copy-paste prompts (fresh install, or merge into an existing setup) that make Claude
+Code itself perform the whole install, personalized to you via a short interview.
+
 ## What's here
 
+- **`ONBOARDING.md`** — two paste-prompts that have Claude Code install and personalize all of
+  this for you (fresh-install and merge-into-existing variants).
 - **`CLAUDE.md.template`** — global instructions (the "constitution"): the tiered memory-system design, the mechanical delegation rules, token-economy levers, index-first exploration, and workflow + security principles. Sanitized — add your own specifics.
 - **`commands/`** — custom slash commands:
   - `/hub` — mission-control dispatcher: one chat that triages everything you paste and delegates the rest, with disk-durable state (see "One-Chat Hub" below)
@@ -35,9 +41,12 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
   - `context-firewall.py` (PostToolUse) — nudges the main loop when it's doing bulk direct reads instead of delegating them
 - **`templates/`** — drop-in file skeletons, e.g. `hub-board.md`, the empty board the One-Chat Hub reads and writes (see below).
 - **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review), example `launchd` job definitions, and notes on keeping tool grants narrow.
-- **`settings.example.json`** — how to register the hooks and set defaults.
+- **`settings.example.json`** — how to register the hooks.
 
 ## Setup
+
+Hands-off path: paste a prompt from [`ONBOARDING.md`](ONBOARDING.md) and Claude does all of
+this for you. By hand:
 
 1. Copy `CLAUDE.md.template` → `~/.claude/CLAUDE.md` and fill in the placeholders.
 2. Copy `commands/` → `~/.claude/commands/`, `hooks/` → `~/.claude/hooks/` (then `chmod +x` the shell hooks), and `routines/` → `~/.claude/routines/` if you want scheduled runs.
