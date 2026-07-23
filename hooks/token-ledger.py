@@ -74,19 +74,24 @@ def accumulate(path, acc, models):
                 obj = json.loads(line)
             except Exception:
                 continue
-            msg = obj.get("message") or {}
-            usage = msg.get("usage")
-            if not usage:
+            # Per-line fault isolation: one structurally-bad entry (string-typed
+            # token counts, non-dict JSON) must skip, not zero the whole session.
+            try:
+                msg = obj.get("message") or {}
+                usage = msg.get("usage")
+                if not usage:
+                    continue
+                t = tier(msg.get("model", ""))
+                if not t:
+                    continue
+                models.add(msg.get("model"))
+                a = acc.setdefault(t, [0, 0, 0, 0])
+                a[0] += int(usage.get("input_tokens") or 0)
+                a[1] += int(usage.get("output_tokens") or 0)
+                a[2] += int(usage.get("cache_creation_input_tokens") or 0)
+                a[3] += int(usage.get("cache_read_input_tokens") or 0)
+            except Exception:
                 continue
-            t = tier(msg.get("model", ""))
-            if not t:
-                continue
-            models.add(msg.get("model"))
-            a = acc.setdefault(t, [0, 0, 0, 0])
-            a[0] += usage.get("input_tokens", 0) or 0
-            a[1] += usage.get("output_tokens", 0) or 0
-            a[2] += usage.get("cache_creation_input_tokens", 0) or 0
-            a[3] += usage.get("cache_read_input_tokens", 0) or 0
 
 def log_error(msg):
     # Best-effort diagnostics — must never itself raise or block the hook.
