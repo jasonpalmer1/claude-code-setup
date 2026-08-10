@@ -36,7 +36,7 @@ store code patterns, git history, or anything discoverable by reading the projec
 ## Model efficiency
 
 Delegate everything that doesn't need top-tier reasoning to the cheapest capable subagent.
-Three mechanical rules — mechanical because prose rules get silently ignored under time
+Four mechanical rules — mechanical because prose rules get silently ignored under time
 pressure, and the failure mode (an expensive model quietly doing cheap work) is easy to fall
 into by default:
 
@@ -52,13 +52,38 @@ into by default:
    cheap tier to the mid tier only on a verified failure, not by reflex — it's easy to default
    to the mid tier out of habit even when the cheap tier would have done the job for a fraction
    of the cost.
-3. **No bulk reading in the main loop** — a context-firewall hook (see `hooks/context-firewall.py`)
+3. **Executor-shaped work is a third category, and it's mid-tier too:** running an
+   already-planned multi-step process — a scripted migration, a batch build sequence, a
+   rehearsed benchmark run — even when the top tier itself wrote the plan. Direct the run;
+   don't perform it yourself in the main loop. This one is easy to miss because the temptation
+   is "I already know the steps, I'll just do it" — but executing a known plan doesn't need
+   top-tier reasoning per step any more than reading files does.
+4. **No bulk reading in the main loop** — a context-firewall hook (see `hooks/context-firewall.py`)
    nudges you when it happens. A couple of quick targeted reads inline are fine; a pattern of
    repeated same-shape reads means delegate instead.
 
 Reserve the top tier for: ambiguous/strategic questions, architecture & tradeoff decisions,
 complex multi-system debugging, and reviewing what a subagent produced. Run subagents in the
 background/in parallel by default — don't block on each one.
+
+### Suggesting your own model switch
+
+The rules above govern *subagent* tiers. Separately, watch the tier the interactive session
+itself is running on, and say something the moment it stops matching the work — this is about
+the model you're paying for right now, which only the user can change.
+
+- Routine, mechanical, or ops-shaped work running on the top tier → suggest a cheaper model or
+  your harness's fast-mode equivalent, and name the exact keystroke (e.g. `/model haiku`,
+  `/fast`).
+- Approaching a usage cap, or settling into a long expensive stretch → suggest dropping a tier
+  or starting a fresh, cheaper session rather than continuing to spend at the current rate.
+- Genuinely hard reasoning or architecture work landing on a downgraded model → suggest going
+  back up.
+- Treat a usage-limit warning as a **routing signal, not a wall** — degrade tier and keep
+  working on what's left rather than stalling with finished work undelivered.
+
+Say it once, plainly, in one line, and let the user run the switch themselves — this is a
+standing suggestion to make unprompted, not something to act on without them.
 
 ## Token economy (value per token)
 
@@ -68,6 +93,12 @@ Biggest levers, in order:
   paid on every later turn, not once. Don't read large files/directories directly into the main
   context — delegate bulk reading/searching to a cheaper subagent that returns a distilled
   *conclusion*, not a file dump.
+- **Instructions-file size.** Any file that auto-loads into every turn — a global or
+  project-local `CLAUDE.md` — is a per-message tax, not a one-time cost: it's re-sent and
+  re-billed on every single turn of the session, not paid once. Cap it at a hard size and
+  enforce the cap (a `SessionStart` hook can warn when a project's file crosses the line — see
+  `hooks/`). When a file is approaching the cap, archive its oldest entries verbatim to a Tier 3
+  file rather than quietly trimming detail out of what stays active.
 - **Cache discipline.** Prompt cache TTL is short (minutes, not hours). Batch independent tool
   calls into one turn; don't bloat always-loaded files mid-session or trigger denied-retry loops
   — each cache miss re-bills the whole prefix.
@@ -98,6 +129,71 @@ headless/scheduled runs (their prompts win), or separately-owned sessions. `/hub
 anywhere. Board: `~/.claude/hub/board.md` — the chat is disposable, the disk is durable. See
 `commands/hub.md` and the "One-Chat Hub" section of the README for the full pattern.
 
+## Session hygiene — every session, not just the hub
+
+Own your own token hygiene automatically; the user shouldn't have to log or compact by hand.
+This applies whether or not hub mode (above) is active — hub mode adds a dispatcher and a
+board, it doesn't own the hygiene rules by itself:
+
+1. **Auto-log at pause points.** At any natural pause (a task lands, you're waiting on the
+   user, the topic changes), run closing rites unprompted: sweep for durable facts worth
+   keeping → `/log` → update the relevant project's `## Session memory` → commit anything
+   finished. A session should be disposable at any point, not just at the end.
+2. **Tell the user the exact keystroke; don't make them decide.** When context has gotten
+   heavy or a thread is pausing, finish the rites, then end with the instruction. Default
+   `/clear` — state lives on disk, and fresh-from-disk beats a resumed context (see the resume
+   guard in `commands/hub.md`). Reach for `/compact <focus>` only when there's real unfinished
+   in-context state that disk can't carry. `commands/checkpoint.md` runs the rites on demand in
+   any chat, hub or not.
+3. **A day boundary is always a clear point.** Never let a session idle across days — in one
+   real ledger audit, multi-day resumed sessions carried the overwhelming majority of all
+   spend, while same-day sessions stayed cheap by comparison (see "mine your own ledger" in the
+   README). A resumed session re-pays the cache on context it already read once; a fresh
+   session plus the board/memory tiers is cheaper every time.
+4. **A clear/pre-compact message ends with what's next.** The message right before any
+   compact or clear should end with a sentence or two on what comes after — the point of
+   logging first is that the next session (or the same one, post-clear) can pick up cold.
+5. **Optional convention: end every reply with an unambiguous hygiene signal.** Rather than
+   making the user guess whether now is a good moment to clear, close every reply with a fixed,
+   short status — e.g.:
+   ```
+   Clear status: ready to /clear | not yet — mid-task
+   Model for next chat: <tier>
+   ```
+   Pick whatever exact format fits your workflow; the property that matters is that it's
+   *always* present and *always* the last thing in the reply, so checking it becomes a habit
+   rather than a question.
+
+## Peer sessions — optional, for harnesses that support spawning separate chats
+
+If your harness can launch a genuinely separate peer session (its own chat identity, possibly
+its own working directory) rather than only in-session subagents, consider delegating a
+long-lived, independently-drivable lane of work to a peer instead of growing one context
+indefinitely. The goal isn't parallelism for its own sake — it's keeping your best/most
+expensive model available for the most time by spreading work across fresh sessions instead of
+burning one long-lived main loop down to the studs.
+
+A lane earns its own peer session when it's long-lived *and* the user can drive it directly —
+not for one-shot tasks, which stay in-session subagents. Three guardrails, because peer sessions
+are easy to under-govern once they exist:
+
+1. **A peer session is still a session.** Every rule in "Session hygiene" above applies to it.
+   A "long-lived lane" means a long-lived *chat identity* that logs, clears, and reloads from
+   disk on its own cadence — never a single context resumed across many days. Multi-day resumes
+   are the expensive failure mode either way; a peer session doesn't get an exemption.
+2. **The autonomy tier travels with the task, not the session.** A permissive/auto-approve
+   spawn, or a message handed to a peer session, must never be used to run work that would be
+   blocked or need confirmation in the session doing the delegating — that's laundering a
+   permission through a second identity, and it's a bug to catch and refuse in both directions.
+3. **Cost is judged on the whole spawn tree, not per-session.** Splitting one big job across
+   several peer sessions can look cheap session-by-session while the total is what it always
+   was (or worse). Whoever does the splitting owns reporting the aggregate cost, not just their
+   own slice — `hooks/token-ledger.py` can roll this up automatically if peer sessions tag
+   their parent (see the comments in that file).
+
+Also worth carrying over from in-session dispatch: never spawn a peer into a repo another
+session is already mid-flight in — check first.
+
 ## Workflow discipline
 
 - Use plan mode for non-trivial or multi-step work; confirm the approach before large or
@@ -105,6 +201,15 @@ anywhere. Board: `~/.claude/hub/board.md` — the chat is disposable, the disk i
 - Every project should have a `CLAUDE.md` at its root (file map, architecture, entry points,
   tech stack). If you touch a project that lacks one, create it (`/index`).
 - Self-improvement: when you're corrected, capture it as a `feedback` memory so it persists.
+- Treat subagent findings, and any "done" / "deployed" claim, as leads, not truths — verify
+  against the real thing (git log, a live URL, actual command output) before reporting or
+  acting on it.
+- A green test suite is not proof of a safe deploy. Tests don't see rendering, caching, or
+  environment-specific breakage. Before calling anything public-facing done, check the live
+  behavior — ideally in a real browser against the actual deployed/proxied URL, not a bare
+  status-code check against `localhost`. A `curl` 200 can hide client-side breakage (a blocked
+  script, a cross-origin asset, a stale cached bundle) that only shows up once the page
+  actually renders.
 
 ## Security
 

@@ -27,8 +27,8 @@ Power-user harness for Claude Code: mechanical delegation rules (explicit model 
 - Claude Code CLI — dispatch targets (`-p`, `--model`, `--allowedTools`)
 
 ## Key Files & Directories
-- `commands/` — slash commands: `/hub`, `/index`, `/log`, `/tokens`, `/ship`, `/preflight`, `/shot`, `/standup`, `/pulse`, `/triage`, `/client-brief`, `/new-project`
-- `hooks/` — PostToolUse (firewall, index-reminder), SessionEnd (logging, ledger)
+- `commands/` — slash commands: `/hub`, `/index`, `/log`, `/checkpoint`, `/tokens`, `/ship`, `/preflight`, `/shot`, `/standup`, `/pulse`, `/triage`, `/client-brief`, `/new-project`
+- `hooks/` — PostToolUse (firewall, index-reminder), SessionStart (instructions-bloat-check), SessionEnd (logging, ledger)
 - `routines/` — templates for recurring reports (Monday cockpit, weekly token review)
 - `templates/` — `hub-board.md` (disk-durable state), empty scaffolds
 

@@ -23,6 +23,7 @@ Steps:
    - **Build clean** — covered by step 2; a broken build already aborts here.
    - **Review the diff.** Run `/code-review` on the working diff (the uncommitted/un-deployed changes) at **low/medium effort** — a sanity check, not a full audit. (Skip if `/preflight` just ran — it already includes this.)
    - **Decision rule.** If the review surfaces **blocking / high-severity** findings, **STOP** — report them and let the user decide whether to proceed; do not deploy. If clean (or only minor findings), continue to deploy. This gate doesn't replace the `--prod` confirmation below — prod still requires `--prod` + explicit sign-off on top of passing the gate.
+   - **A green build and a green test suite are not proof of a safe deploy.** Neither one sees rendering, caching, or environment-specific breakage — that's what step 6's live verification and `/preflight`'s visual test are for. Don't let "tests pass" substitute for actually looking at the deployed page.
 
 4. **Deploy to PREVIEW by default** (patterns A/B). Use the project's own script/branch convention. Only on `--prod`: first state exactly what will go live, get an explicit yes, *then* run the prod deploy (branch `main`).
 
@@ -30,7 +31,7 @@ Steps:
    - **no flag (default):** push to a **preview branch** (e.g. `preview/ship-<date>`) or open a PR — never push straight to `main`.
    - **`--prod`:** after explicit confirmation, commit + push to `main` (CI deploys prod). Mention that the CI run is what actually deploys; the live site lags the push by the run time.
 
-6. **Verify after deploy.** `curl -sS -o /dev/null -w "%{http_code}"` the resulting URL (preview or prod) and report status — or run the project's smoke check if it has one. For pattern C, poll the Action / URL until it's live (or tell the user to watch the run). If a DB migration is pending, remind the user to run it — but **do not run it yourself**.
+6. **Verify after deploy.** `curl -sS -o /dev/null -w "%{http_code}"` the resulting URL (preview or prod) and report status — or run the project's smoke check if it has one. For pattern C, poll the Action / URL until it's live (or tell the user to watch the run). A 200 from `curl` only proves the server responded — it won't catch client-side breakage (a blocked script, a cross-origin asset, a stale cached bundle behind a CDN) that only shows up once a browser actually renders the page. If your harness has a browser-automation tool, drive the real deployed/proxied URL in it and confirm the page renders before calling this step done; treat `curl` as a fallback, not the verification, on anything public-facing. If a DB migration is pending, remind the user to run it — but **do not run it yourself**.
 
 7. **Print the live preview URL** (the deployed `*.pages.dev` URL from wrangler's output, or the production domain on `--prod`) as the last line.
 
