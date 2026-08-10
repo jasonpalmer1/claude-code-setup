@@ -17,8 +17,22 @@ ERROR_LOG instead of raising, so the SessionEnd hook never blocks on this.
 
 Invoked by the SessionEnd hook with the transcript path on stdin (hook JSON) or
 as argv[1]. Safe to run manually:  token-ledger.py <transcript.jsonl>
+
+Peer-session spawn-tree rollup (optional, self-contained). If your harness
+lets you spawn separate peer sessions (see "Peer sessions" in
+CLAUDE.md.template), a per-session cost view can hide the real total: three
+peers at $20 each look fine individually but are $60 together, and none of
+them alone crosses a per-session threshold. If a peer-spawning session sets
+PARENT_ENV_VAR (below) in the child's environment to the parent session's id,
+this script records that pointer as an invisible trailing HTML comment on the
+row — a comment, not a new table column, so a plain session's row is
+byte-identical to before this feature existed, and it's a no-op unless you
+actually set the env var. On sessions that have it set, the whole ledger is
+walked to find that session's tree (root + every descendant reachable via the
+parent pointers) and, if the tree's total spend is large with one tier
+dominating the root's own spend, a line is appended to TREE_ALARMS.
 """
-import json, sys, os, glob, datetime, traceback
+import json, sys, os, re, glob, datetime, traceback
 
 # Customize: where to append the usage table. If you use the tiered-memory
 # layout from CLAUDE.md.template, point this at your memory dir instead, e.g.
@@ -27,6 +41,19 @@ LEDGER = os.path.expanduser("~/.claude/token_ledger.md")
 
 # Where write/parse failures get logged instead of failing silently.
 ERROR_LOG = os.path.expanduser("~/.claude/hub/hook-errors.log")
+
+# Set this env var (to the parent session's id) when launching a peer session,
+# if you want spawn-tree cost rollup. Name it whatever your peer-spawn
+# mechanism already uses, or set it yourself in the launch command.
+PARENT_ENV_VAR = "CLAUDE_PEER_PARENT_ID"
+
+# Spawn-tree cost alarms get appended here — informational, never blocking.
+TREE_ALARMS = os.path.expanduser("~/.claude/hub/spawn-tree-alarms.log")
+
+# Alarm thresholds: a tree over TREE_ALARM_MIN_COST with one tier carrying
+# more than TREE_ALARM_SHARE of it is worth a look. Tune to your own ledger.
+TREE_ALARM_MIN_COST = 50.0
+TREE_ALARM_SHARE = 0.60
 
 # $ per million tokens: (input, output, cache_write_5m=1.25x, cache_read=0.1x)
 PRICES = {
@@ -136,7 +163,7 @@ def build_row(tp, sid_full):
         f"| {date} | {sess} | {tot_in:,} | {tot_out:,} | {tot_cw:,} | "
         f"{tot_cr:,} | {hit:.0f}% | ${cost:.2f} | {mix} |\n"
     )
-    return sess, row
+    return sess, row, cost
 
 def write_row(sess, row):
     """Update the row for `sess` in place if it already exists (same line,
@@ -160,6 +187,110 @@ def write_row(sess, row):
         f.writelines(lines)
     os.replace(tmp, LEDGER)        # atomic on POSIX — never a truncated ledger
 
+def parse_ledger_rows(path):
+    """Every data row in the ledger, decoded back into a dict, including its
+    per-tier cost breakdown (parsed from the always-present "By model"
+    column, so this works even for rows written before the spawn-tree
+    feature existed) and its parent pointer, if any (only present on rows
+    from sessions that had PARENT_ENV_VAR set). Header/separator lines are
+    skipped by shape, not a hardcoded line count."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path) as f:
+        for line in f:
+            if not line.startswith("| "):
+                continue
+            parts = line.split("|")
+            if len(parts) < 10:
+                continue
+            date = parts[1].strip()
+            sess = parts[2].strip()
+            if date in ("Date", "") or date.startswith("-") or sess.startswith("-"):
+                continue  # header or |---|---| separator
+            try:
+                cost = float(parts[8].strip().lstrip("$"))
+            except Exception:
+                continue
+            tiers = {}
+            for tok in parts[9].strip().split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    try:
+                        tiers[k] = float(v.lstrip("$"))
+                    except Exception:
+                        pass
+            trailer = parts[10] if len(parts) > 10 else ""
+            m_p = re.search(r"parent:(\S+)", trailer)
+            parent = m_p.group(1) if m_p else ""
+            rows.append({"date": date, "sess": sess, "cost": cost,
+                         "parent": parent, "tiers": tiers})
+    return rows
+
+def check_tree_alarm(sess, date):
+    """Roll up spend across this session's whole spawn tree (root + every
+    descendant reachable via the parent pointers written into the ledger) and
+    alarm if the tree's total spend is large with one tier — whichever tier
+    the ROOT session leaned on most, in its own row — carrying most of it.
+    The root's own dominant tier is read straight from its own "By model"
+    column, so this works whether or not the root session itself was ever
+    tagged with a parent (roots usually aren't). Silently no-ops if the root
+    has no row of its own yet."""
+    rows = parse_ledger_rows(LEDGER)
+    by_id = {r["sess"]: r for r in rows}
+
+    # Walk up parent pointers to the root. Cycle-safe via `seen` — a
+    # malformed chain can't spin this forever.
+    seen, cur = set(), sess
+    while cur in by_id and by_id[cur]["parent"] and cur not in seen:
+        seen.add(cur)
+        cur = by_id[cur]["parent"]
+    root = cur
+    if root not in by_id:
+        return
+
+    # Collect the whole tree by walking parent pointers forward from root.
+    children = {}
+    for r in rows:
+        if r["parent"]:
+            children.setdefault(r["parent"], []).append(r["sess"])
+    tree_ids, frontier = set(), [root]
+    while frontier:
+        nid = frontier.pop()
+        if nid in tree_ids or nid not in by_id:
+            continue
+        tree_ids.add(nid)
+        frontier.extend(children.get(nid, []))
+
+    root_tiers = by_id[root]["tiers"]
+    if not root_tiers:
+        return
+    dominant = max(root_tiers, key=root_tiers.get)
+    tree_total = sum(by_id[i]["cost"] for i in tree_ids)
+    if tree_total <= TREE_ALARM_MIN_COST:
+        return
+    dominant_cost = root_tiers[dominant]
+    if dominant_cost / tree_total <= TREE_ALARM_SHARE:
+        return
+
+    tag = f"spawn-tree root={root}"
+    existing = ""
+    if os.path.exists(TREE_ALARMS):
+        with open(TREE_ALARMS) as f:
+            existing = f.read()
+    if tag in existing:
+        return  # already flagged this tree
+    try:
+        os.makedirs(os.path.dirname(TREE_ALARMS), exist_ok=True)
+        with open(TREE_ALARMS, "a") as f:
+            f.write(
+                f"{date} {tag} dominant={dominant} ${dominant_cost:.0f} = "
+                f"{dominant_cost / tree_total * 100:.0f}% of ${tree_total:.0f} "
+                f"across {len(tree_ids)} session(s) — spawn-tree cost worth a look?\n"
+            )
+    except Exception:
+        log_error("spawn-tree-alarm write: " + traceback.format_exc(limit=2))
+
 def main():
     tp = read_transcript_path()
     if not tp or not os.path.isfile(tp):
@@ -169,8 +300,23 @@ def main():
         built = build_row(tp, sid_full)
         if built is None:
             return
-        sess, row = built
+        sess, row, cost = built
+        date = row.split("|")[1].strip()
+
+        # Peer-session tagging — additive, invisible to the table structure.
+        # Only a session with PARENT_ENV_VAR set gets a trailer at all; a
+        # plain session's row is untouched, byte for byte.
+        parent_raw = os.environ.get(PARENT_ENV_VAR, "").strip()
+        if parent_raw:
+            row = row.rstrip("\n") + f" <!-- parent:{parent_raw[:8]} -->\n"
+
         write_row(sess, row)
+
+        try:
+            if parent_raw:
+                check_tree_alarm(sess, date)
+        except Exception:
+            log_error("spawn-tree-alarm: " + traceback.format_exc(limit=2))
     except Exception:
         log_error(f"{tp}: {traceback.format_exc(limit=4)}")
 

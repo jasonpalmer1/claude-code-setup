@@ -24,6 +24,7 @@ Code itself perform the whole install, personalized to you via a short interview
   - `/hub` — mission-control dispatcher: one chat that triages everything you paste and delegates the rest, with disk-durable state (see "One-Chat Hub" below)
   - `/index` — create/update a project's `CLAUDE.md` codebase map
   - `/log` — summarize the current session into a persistent conversation log
+  - `/checkpoint` — run closing rites on demand (extraction sweep → log → disk state → the exact next keystroke) in any chat, not just the hub
   - `/tokens` — review the token ledger, spend trends, and a delegation-ratio metric
   - `/ship` — deploy-and-verify a web project, safe by default (preview, never production without an explicit flag + confirmation), gated on `/preflight` before anything public/client-facing
   - `/preflight` — pre-ship checklist covering common shipping-incident classes: real-looking names in demo data, unverified claims in public copy, oversized inline images breaking mobile Safari, stale-cache asset swaps, secrets in the diff, and mobile-viewport visual testing
@@ -37,8 +38,9 @@ Code itself perform the whole install, personalized to you via a short interview
 - **`hooks/`** — automation:
   - `index-reminder.sh` (PostToolUse) — nudges you to map a project that has no `CLAUDE.md`
   - `session-end-log.sh` (SessionEnd) — auto-summarizes the session (on a cheaper model) and appends a usage row
-  - `token-ledger.py` — parses a session transcript (and its subagents' transcripts) and logs per-model token spend (pure parsing, no model call, costs nothing)
+  - `token-ledger.py` — parses a session transcript (and its subagents' transcripts) and logs per-model token spend (pure parsing, no model call, costs nothing); also rolls up spend across a whole peer-session spawn tree if sessions tag their parent (see the file's header comment)
   - `context-firewall.py` (PostToolUse) — nudges the main loop when it's doing bulk direct reads instead of delegating them
+  - `instructions-bloat-check.py` (SessionStart) — warns when the current project's `CLAUDE.md` has crossed a size cap, since it's re-sent (and re-billed) on every turn of every session working there
 - **`templates/`** — drop-in file skeletons, e.g. `hub-board.md`, the empty board the One-Chat Hub reads and writes (see below).
 - **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review), example `launchd` job definitions, and notes on keeping tool grants narrow.
 - **`settings.example.json`** — how to register the hooks.
@@ -80,6 +82,12 @@ Two mechanical rules, backed by the context-firewall hook, because prose rules a
 ### Headless routines
 
 `routines/` templates a pattern for recurring reports that show up without you asking: a shell script that calls `claude -p "<prompt>" --model <tier> --allowedTools "<narrow list>"`, scheduled by a `launchd` plist (the macOS mechanism; substitute cron/systemd elsewhere). Because a headless run has no one watching to approve a permission prompt, the tool grant should be the minimum that lets the routine do its one job — a fixed read-only script by exact path, a couple of read-only command prefixes, write access to exactly one output file. See `routines/README.md` for the full pattern and what to fill in.
+
+### Peer sessions
+
+The delegation rules above (state the model, cheap tier for read-shaped work) govern subagents *within* one session. If your harness can also spawn genuinely separate peer sessions — their own chat identity, possibly their own working directory — the same economic logic extends one level up: a long-lived, independently-drivable lane of work (a second project, a build worth watching progress on) is often cheaper handed to a fresh peer session than ground through in one context that keeps growing. The goal is keeping your best model available for the most time, not parallelism for its own sake.
+
+Peer sessions need their own guardrails or they're easy to under-govern: every session-hygiene rule still applies to each one (a "long-lived lane" is a long-lived chat identity that logs and clears on its own cadence, never a context resumed for days on end); the autonomy tier travels with the *task*, not the session, so a permissive spawn can never be used to route around a permission the delegating session would itself be refused; and cost gets judged on the whole spawn tree, not session-by-session, which is what the parent-tagging feature in `hooks/token-ledger.py` is for. Full pattern in the "Peer sessions" section of `CLAUDE.md.template`.
 
 ### Second machine
 
