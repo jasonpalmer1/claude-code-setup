@@ -14,6 +14,11 @@ macOS scheduling mechanism.
 - **`standup-scan.sh`** — the read-only git-fleet scan that `/standup` and `monday-cockpit.sh`
   both use; kept as its own file so a launchd job can allowlist it **by exact path** instead of
   granting broad shell access.
+- **`claude-md-diet.sh`** — weekly context-bloat surgery: finds every project `CLAUDE.md` over
+  the size cap and runs a headless mid-tier session that archives the oldest material verbatim
+  to that project's `ARCHIVE.md`, verifying no line is lost before writing. The unattended
+  companion to `hooks/instructions-bloat-check.py`, which only warns when someone happens to be
+  in the project.
 - **`*.plist.example`** — launchd job definitions. Copy (don't symlink) into
   `~/Library/LaunchAgents/`, rename to a reverse-DNS label you own (e.g.
   `com.<you>.claude.monday-cockpit.plist`), fix the paths inside, then:
