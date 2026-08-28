@@ -15,6 +15,57 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
 has two copy-paste prompts (fresh install, or merge into an existing setup) that make Claude
 Code itself perform the whole install, personalized to you via a short interview.
 
+## Running AI safely when you're not an engineer
+
+I don't read every line an agent writes before it runs — that's the whole point of directing one
+instead of doing the work by hand. What follows isn't a security essay; it's the practical habits
+that make it safe to hand over that much control, plus the mechanical backstops so the habits
+hold on a day I'm moving fast and would otherwise skip a step.
+
+**Permission modes are a gate I pick on purpose, not a default I tolerate.** The mode should
+match the task's risk, not whatever I happened to be in last: a quick local edit can run loose,
+but anything hard to reverse or outward-facing gets a mode that stops and asks first. "Ask before
+doing this" is a feature I lean on, not friction to route around — and since that rule is easy to
+skip under time pressure, `hooks/mcp-guard.py` makes the highest-risk case (money, mass outbound,
+destroying live state) a hard block instead of a prompt I could talk myself past, unless I
+explicitly confirm it in that exact conversation.
+
+**A written, explicit never-do list is a real file, not something I trust myself to remember.**
+Anything an agent should never touch or publish — a project not ready to be named publicly, a
+class of data that shouldn't leave the machine — goes in a file every agent touching that kind of
+work is told to read, the same way this repo's own do-not-touch registry works. Writing it down
+is what lets an agent under a deadline, and a future me who's forgotten the context, both get it
+right — neither can be trusted to "just remember."
+
+**The pass that produces content should never be the pass that clears it for release.** An agent
+optimizing to finish a task is a bad judge of whether that same output is safe to publish — it's
+motivated to be done, not to doubt itself. A second pass, in fresh context, told explicitly to
+read the output adversarially ("hunt for exactly what the never-do list forbids, like a
+leak-scanner, not a collaborator") catches what the first pass won't. `hooks/safety-guard.py` is
+the mechanical floor under the same idea: it blocks a secret-shaped string or a credential literal
+from ever reaching a file, on every write, so the adversarial pass isn't the only thing standing
+between a mistake and a commit — and `hooks/security-tripwire.py` checks, on every session start,
+that guards like that one are actually still firing, since a control that's quietly stopped
+working is worse than no control at all.
+
+**A subagent's report describes what it intended, not necessarily what happened.** Before
+anything ships, I check the actual diff, the actual file, the actual live page — not the summary
+of it. That's the same discipline behind the standing pre-ship checklist I run before anything
+public or client-facing (`/preflight` in this repo): a distilled list of the mistakes that have
+actually shipped before — a secret in a diff, an unverified claim in public copy, realistic-looking
+demo data, a stale cache serving the old page, a layout bug only a real phone shows. Running it
+mechanically, every time, is cheaper than living through the same incident twice.
+
+**None of this is affordable if every check runs on the expensive model.** Routing mechanical
+work — scans, read-throughs, first-pass drafts — to a cheaper, faster tier and saving the
+expensive one for judgment calls and reviewing what the cheap tier produced
+(`hooks/model-guard.py` makes that choice explicit, not optional) is what makes it realistic to
+run enough of the above instead of skipping half of it to save money.
+
+**And I close out work in disposable, bounded chunks instead of letting one conversation run for
+days.** A fresh session with a clear scope is something I — or a second reviewer — can actually
+audit end to end; a context accumulating for a week is not.
+
 ## What's here
 
 - **`ONBOARDING.md`** — two paste-prompts that have Claude Code install and personalize all of
@@ -35,14 +86,28 @@ Code itself perform the whole install, personalized to you via a short interview
   - `/client-brief` — draft a client-facing progress update (plain English + screenshots) from recent git history
   - `/commands` — routes "what should I use for X" to the right command, or prints the full cheat-sheet
   - `/new-project` — scaffold a new project matching a set stack convention, end to end (scaffold → codebase map → deploy scripts → first commit)
+  - `/hub-audit` — monthly adversarial self-audit of the hub: a fresh, context-free worker hunts for drift, stale rules, and self-flattering bookkeeping across the board, ledger, and memory
+  - `/forge` — proactive idea generation from your OWN inventory (warm channels, live assets, reusable stack), pre-screened against your own settled kills — the generative counterpart to `/triage`
+  - `/selfaudit` — mines your own accumulated logs/memory/ledger for behavior corrections nobody's written down yet, so self-improvement doesn't require you to notice and ask for it
 - **`hooks/`** — automation:
   - `index-reminder.sh` (PostToolUse) — nudges you to map a project that has no `CLAUDE.md`
   - `session-end-log.sh` (SessionEnd) — auto-summarizes the session (on a cheaper model) and appends a usage row
   - `token-ledger.py` — parses a session transcript (and its subagents' transcripts) and logs per-model token spend (pure parsing, no model call, costs nothing); also rolls up spend across a whole peer-session spawn tree if sessions tag their parent (see the file's header comment)
   - `context-firewall.py` (PostToolUse) — nudges the main loop when it's doing bulk direct reads instead of delegating them
   - `instructions-bloat-check.py` (SessionStart) — warns when the current project's `CLAUDE.md` has crossed a size cap, since it's re-sent (and re-billed) on every turn of every session working there
+  - `mcp-guard.py` (PreToolUse) — hard-blocks an MCP tool call that moves money, sends mass outbound, or destroys live state unless explicitly bypassed for that one call — the enforcement backstop behind a written connector risk policy
+  - `model-guard.py` (PreToolUse) — blocks any subagent spawn with no explicit model, so a spawn can never silently inherit your most expensive tier by accident
+  - `safety-guard.py` (PreToolUse) — blocks a small set of catastrophic shell commands and a secret/credential literal from ever reaching a file, on every write
+  - `security-tripwire.py` (SessionStart) — re-verifies, on every session start, that controls like `safety-guard.py` are actually still firing, and scans your tracked config files for a credential-shaped literal before it gets pushed
+  - `cost-meter.py` (UserPromptSubmit) — a live running-cost warning during a session (not just after it ends), so a long session gets flagged while there's still time to wrap it up
+  - `transcript-monitor.py` (UserPromptSubmit) — warns when the transcript itself has grown large enough that a checkpoint is due, independent of dollar cost
+  - `pre-compact-archive.sh` (PreCompact) — copies the raw transcript aside before compaction, cheap insurance against detail a summary would drop
+  - `session-autoname.py` (UserPromptSubmit) — renames a session after what it's actually working on, so a list of concurrent sessions is legible at a glance
+  - `inbox-capture.sh` (UserPromptSubmit) — ambient, secret-scrubbed raw capture of every prompt, as a fallback feed a memory-extraction sweep can diff against
+  - `pattern-capture-check.sh` (SessionEnd) — logs whether your pattern journal (see the Memory autopilot section of `commands/hub.md`) gained a same-day entry, for a staleness nudge elsewhere to key off
+  - `memory-activate.py` / `memory-graph-refresh.sh` / `memory-health-nag.py` — an optional evolution of the flat memory index into a small linked graph with spreading-activation retrieval (see "Memory graph" below)
 - **`templates/`** — drop-in file skeletons, e.g. `hub-board.md`, the empty board the One-Chat Hub reads and writes (see below).
-- **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review), example `launchd` job definitions, and notes on keeping tool grants narrow.
+- **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review, a weekly `CLAUDE.md` bloat-surgery pass), example `launchd` job definitions, and notes on keeping tool grants narrow.
 - **`settings.example.json`** — how to register the hooks.
 
 ## Setup
@@ -69,6 +134,8 @@ The single biggest change in this iteration: memory isn't one flat, ever-growing
 - **Tier 3 (`ARCHIVE.md`)** holds anything dormant — killed ideas, wound-down projects, rarely-needed references — indexed but never auto-loaded. Nothing gets deleted, just demoted out of the context every session pays for.
 
 The effect: the always-loaded index stays small no matter how much history accumulates, because history has somewhere else to live.
+
+**Memory graph (optional evolution).** Once you have enough memory files that a flat index stops being enough — you can't remember which file covers what, or two files have quietly drifted into saying contradictory things — the index can grow a lightweight graph of typed links between memory files instead of staying a plain table of contents: a small `graph/build.py` that derives the links, and a `graph/retrieve.py` that does spreading-activation retrieval — given the session's working directory and opening prompt, activate a few seed files and spread across their links to surface the handful actually relevant right now, instead of loading the whole index every turn. The same graph can carry a `contradicts`/`superseded` flag between two memories, so a session is told about a live contradiction instead of silently picking one side. `hooks/memory-activate.py` is the retrieval hook that injects this pointer block at session start; `hooks/memory-graph-refresh.sh` debounces a background rebuild whenever a memory file changes, instead of waiting on a weekly job; `hooks/memory-health-nag.py` surfaces one line, only when something's actually wrong, from a health-check log a `graph/maintain.py` script would write. This trio is scaffolding around a small graph engine you write yourself once you're at the scale that needs it — not a database, just another layer of plain files.
 
 ### Delegation philosophy
 
