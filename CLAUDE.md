@@ -1,46 +1,82 @@
-# claude-code-setup
+# Global Instructions (worked example)
 
-Opinionated Claude Code configuration template built around tiered file-based memory, cost discipline, project indexing, and headless automation.
+This is a real, filled-in example of `CLAUDE.md.template` — not a second template. Read
+`CLAUDE.md.template` first for the design and the placeholders; this file shows one way
+they end up filled in day to day, so `OPERATOR.md` shows the same thing for the contract
+layer. Copy the structure, not the specifics — the file paths, thresholds, and rule names
+below are illustrative, not prescriptive.
 
-## Purpose
-Power-user harness for Claude Code: mechanical delegation rules (explicit model per subagent call, default cheapest tier for read-shaped work), context-firewall hook to avoid bulk reads in expensive main loop, token-ledger tracking, and self-maintaining project maps (`CLAUDE.md` per repo).
+`@OPERATOR.md` at the very top of your real `CLAUDE.md` is what makes the contract
+auto-load into every session; this example starts from that same line.
 
-## Architecture
-- **Tier 1 (MEMORY.md)**: always-loaded index, ~40 lines max
-- **Tier 2 (project-local)**: `CLAUDE.md` in each project's root
-- **Tier 3 (ARCHIVE.md)**: dormant projects, killed ideas, rarely-accessed references
-- **One-Chat Hub**: mission-control dispatcher in `~`, triages tasks to workers, maintains durable board
+## Delegation
 
-## Entry Points
-- `README.md` — setup guide and design rationale
-- `ONBOARDING.md` — paste-prompts that make Claude Code perform the install (fresh / merge)
-- `CLAUDE.md.template` — global instructions skeleton (copy to `~/.claude/CLAUDE.md`)
-- `commands/hub.md` — Hub protocol and routing
-- `hooks/context-firewall.py` — nudges away from bulk reads in main loop (PostToolUse)
-- `hooks/session-end-log.sh` + `hooks/token-ledger.py` — cost tracking
-- `settings.example.json` — hook registration template
+Every subagent call states `model:` explicitly, never inherited (a `model-guard.py`
+hook can enforce this mechanically). Cheapest tier for read-shaped work (search,
+extract, census). Mid tier for code-shaped and executor work. Workers are typed,
+stateless calls to files under `agents/` that write a report and exit. The hub
+supervises and should act mainly as a dispatcher, not do all the work itself — but
+still: one owner per repo at a time, every handoff names the scope and what the
+receiver now owns, and a handoff is never a route to perform something refused or
+gated in the sending session. Read the project's `CLAUDE.md` before spawning agents;
+delegated workers do too. No bulk reading in the main loop — a third same-shape read
+means delegate instead.
 
-## Tech Stack
-- Shell (Bash) — hook runners, routine templates
-- Python — token ledger parser (pure parsing, no model calls)
-- launchd/cron — scheduled, headless routine triggers
-- Claude Code CLI — dispatch targets (`-p`, `--model`, `--allowedTools`)
+## Memory
 
-## Key Files & Directories
-- `commands/` — slash commands: `/hub`, `/index`, `/log`, `/checkpoint`, `/tokens`, `/ship`, `/preflight`, `/shot`, `/standup`, `/pulse`, `/triage`, `/client-brief`, `/new-project`
-- `hooks/` — PostToolUse (firewall, index-reminder), SessionStart (instructions-bloat-check), SessionEnd (logging, ledger)
-- `routines/` — templates for recurring reports (Monday cockpit, weekly token review)
-- `templates/` — `hub-board.md` (disk-durable state), empty scaffolds
+Three tiers under your memory directory: `MEMORY.md` (the always-loaded router) →
+each project's own `CLAUDE.md` under a `## Session memory` heading → an `ARCHIVE.md`
+plus a `conversations/` log directory for anything dormant. "Remember this" saves to
+the right tier immediately, never duplicates an existing entry. Keep the project-local
+tier capped at a size you're comfortable re-sending every turn (a few tens of
+thousands of characters is a reasonable starting cap).
 
-## Token Economy Principles
-1. Every subagent call explicitly states `model:` (no inheritance of expensive defaults)
-2. Default Haiku for read-shaped work (search, extract, summarize); Sonnet for code/config changes
-3. Context firewall nudges bulk reads to subagents, keeps main-loop context lean
-4. Cache discipline: batch independent calls, avoid mid-session edits, log spend per session
+## Token economy
 
-## Setup
-1. Copy `CLAUDE.md.template` → `~/.claude/CLAUDE.md`, fill placeholders
-2. Copy `commands/` → `~/.claude/commands/`, `hooks/` → `~/.claude/hooks/`, `routines/` → `~/.claude/routines/`
-3. Merge `settings.example.json` into `~/.claude/settings.json`
-4. Adjust paths and watched project roots in hook configs
-5. Create memory directory with empty `MEMORY.md` index
+In rough order of leverage: a context firewall (delegate bulk reads instead of paying
+for them in the main loop) beats cache discipline (batch independent tool calls) beats
+cheap-first escalation (start cheap, escalate only on a verified failure) beats
+verify-by-stakes (heavier checks where the stakes are higher) beats hygiene triggers
+(two failed fixes in a row means stop and log/clear) beats simply measuring spend and
+tuning from data (`/tokens`, a token ledger hook).
+
+## Session hygiene
+
+Every session logs at natural pause points (`/log`, a board update, a commit) and ends
+each reply with a short status line naming the model in use — never a request for you
+to type `/clear` yourself. At a size threshold, a session writes its own resume state
+(what's done, what's next) and keeps working; let your harness's own context/compaction
+management handle the rest. A session that truly cannot continue hands off to whatever
+supervises it (a hub session, or you directly) rather than just stopping silently.
+
+## Hub mode
+
+A session started in your hub directory (or wherever you designate as "not inside a
+project") is the hub: it reads `commands/hub.md` and runs that protocol. A `/hub`
+command can arm it anywhere; a message prefixed `inline:` stays in the current chat
+with no dispatch.
+
+## Workflow discipline
+
+For anything non-trivial: a written plan first (a `planner` agent, or plan mode),
+review and approval, then build, then a user-perspective playtest, then a bug check on
+the exact diff (a hard FAIL blocks shipping), then a final human read of the actual
+code or page before it goes live. Corrections you give the assistant become a
+`feedback`-type memory immediately, not just a one-off chat aside.
+
+## Storage
+
+If you use cloud storage, state your own default here (e.g. "archives and finished
+artifacts go to cloud storage; local disk holds only what's actively being worked
+on"). Regenerable things (`node_modules`, build output, caches) are deleted, never
+uploaded. Irreplaceable things are copied to the cloud and verified present before the
+local copy is removed.
+
+## Security
+
+Secrets live in `.env` or a dedicated secret store, never committed or echoed into a
+chat, log, or memory file. Never hot-edit your live `settings.json` from inside a
+running session if your harness reloads it live into every active chat — let changes
+wait for a fresh session. If you use MCP connectors, tier them by risk: money-moving or
+mass-send actions need a per-action go-ahead; outward writes need an explicit go;
+internal reads can run under your normal autonomy default.

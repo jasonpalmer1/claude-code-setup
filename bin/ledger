@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""ledger: append-only, proof-backed open-items tracker.
+
+Storage: ~/.claude/hub/ledger.jsonl — one JSON event per line, never rewritten
+in place. An item's current state is the fold of every line for its id,
+last-write-wins per field, in file order (concurrent writers use O_APPEND so
+lines never corrupt each other; see hub/strategy/agent-framework-2026-09-06/
+F-ledger-design.md for the schema this implements).
+
+Folded record fields (kept EXACT so other tools/HQ can build against them):
+  id, title, status, asked_on, asked_by, owner, trigger, proof, last_surfaced,
+  jason_ack, created_at, updated_at   (+ project, an extra convenience field)
+
+status values: open | active | needs-jason | done | dropped
+
+Commands:
+  ledger add "<title>" [--asked-by jason|hub] [--project X] [--owner Y]
+  ledger status <id> open|active|needs-jason|done|dropped
+  ledger proof <id> <type> <ref> [--note "..."]
+  ledger ack <id>
+  ledger claim <id> <owner>       # you (or the named owner) now hold it
+  ledger release <id>             # owner -> unowned
+  ledger reassign <id> <owner>    # hand it to a different owner
+  ledger list [--status STATUS] [--json]
+  ledger surface
+  ledger banner
+
+Hard rule: `ledger status <id> done` refuses (exit 1) unless at least one
+`proof` event already exists for that id whose type COUNTS toward the gate
+(see ledger_lib.has_done_gate_proof() -- A3, L-0763 hub audit, 2026-09-22:
+`metric-claim`/`metric-claim-verdict` proof events are recorded and stay
+fully visible, but do not by themselves satisfy this gate; a claim about a
+metric is not proof the underlying work happened).
+
+`ledger status <id> active` (a "claim") auto-attaches a `claimed_by: {pid,
+session_id}` field from CLAUDE_PID/CLAUDE_CODE_SESSION_ID when run inside a
+Claude Code process (L-0372). This records WHO claimed a ticket, not just
+WHEN (`ts`, already on every event). `bin/status` uses it to tell a live
+claim apart from one whose claiming session no longer exists -- see that
+script's CLAIM_STALE_HOURS for the expiry rule. Claims made before this fix
+have no `claimed_by`; the reader falls back to time-only for those.
+
+`ledger claim <id> <owner>` / `ledger release <id>` / `ledger reassign <id> <owner>` (L-0377b):
+the only way to set an item's `owner` field used to be `add --owner` at creation time -- nothing
+let a later session record that it now holds a ticket, or hand it back, so tickets kept
+displaying `owner: unowned` while a session was actually holding them (first hit on L-0361
+itself). These three all append one underlying `owner` event and never touch `status` -- who
+owns a ticket and whether anyone is actively working it (`status active`, a separate claim with
+its own `claimed_by`/`claimed_at`) are different questions and move independently.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from ledger_lib import (  # noqa: E402
+    VALID_ASKED_BY,
+    VALID_STATUSES,
+    append_event,
+    banner_lines,
+    claim_actor,
+    fold,
+    has_done_gate_proof,
+    ledger_lock,
+    next_id,
+    now_iso,
+    read_events,
+    surface_lines,
+    today_str,
+    unreviewed_issues,
+)
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    title = args.title.strip()
+    if len(title) > 60:
+        title = title[:57] + "..."
+    with ledger_lock():
+        events = read_events()
+        eid = next_id(events)
+        event = {
+            "ts": now_iso(),
+            "id": eid,
+            "event": "created",
+            "title": title,
+            "asked_by": args.asked_by,
+            "asked_on": today_str(),
+            "owner": args.owner or "unowned",
+            "trigger": "",
+            "project": args.project,
+        }
+        append_event(event)
+    print(eid)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    events = read_events()
+    records = fold(events)
+    rec = records.get(args.id)
+    if rec is None:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+
+    if args.new_status == "done" and not has_done_gate_proof(rec):
+        # A3 (L-0763 hub audit): a metric-claim/metric-claim-verdict proof
+        # event alone does not satisfy this gate -- see
+        # ledger_lib.has_done_gate_proof()'s docstring.
+        reason = (
+            "only metric-claim/metric-claim-verdict proof recorded (a claim is not proof)"
+            if rec["proof"] else "no proof recorded yet"
+        )
+        print(
+            f"ledger: refusing to mark {args.id} done - {reason}. "
+            f"Run `ledger proof {args.id} <type> <ref>` first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    event = {
+        "ts": now_iso(),
+        "id": args.id,
+        "event": "status",
+        "status": args.new_status,
+    }
+    if args.new_status == "active":
+        # L-0372: capture WHO is claiming this, not just WHEN. Silent no-op
+        # (no extra field) outside a Claude Code process, so this is
+        # additive-only and never breaks a manual/test invocation.
+        actor = claim_actor()
+        if actor:
+            event["claimed_by"] = actor
+    with ledger_lock():
+        append_event(event)
+    print(f"{args.id}: {rec['status']} -> {args.new_status}")
+    return 0
+
+
+def cmd_proof(args: argparse.Namespace) -> int:
+    events = read_events()
+    records = fold(events)
+    if args.id not in records:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+    proof = {"type": args.type, "ref": args.ref}
+    if args.note:
+        proof["note"] = args.note
+    with ledger_lock():
+        append_event({
+            "ts": now_iso(),
+            "id": args.id,
+            "event": "proof",
+            "proof": proof,
+        })
+    print(f"{args.id}: proof recorded ({args.type}: {args.ref})")
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    events = read_events()
+    records = fold(events)
+    if args.id not in records:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+    with ledger_lock():
+        append_event({
+            "ts": now_iso(),
+            "id": args.id,
+            "event": "ack",
+            "jason_ack": True,
+        })
+    print(f"{args.id}: acked")
+    return 0
+
+
+def cmd_owner(args: argparse.Namespace) -> int:
+    """Set an item's owner without touching its status (L-0377b).
+
+    `claim`/`reassign` both record who holds the ticket now (`reassign` is
+    `claim` under another name, for handing a ticket someone else already
+    held rather than picking up an unowned one -- the underlying event is
+    identical); `release` records that nobody does. See this file's module
+    docstring for why this is deliberately separate from `status active`.
+    """
+    events = read_events()
+    records = fold(events)
+    if args.id not in records:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+    owner = "unowned" if args.action == "release" else args.owner
+    with ledger_lock():
+        append_event({
+            "ts": now_iso(),
+            "id": args.id,
+            "event": "owner",
+            "owner": owner,
+        })
+    print(f"{args.id}: owner -> {owner}")
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """Attach a free-text note to an item without changing its status.
+
+    Added 2026-09-15 for L-0314 (Mission HQ ticket tracker): the dispatcher
+    needs to record "the operator tapped: <option>" against a ticket whose status it
+    is also flipping (active for a fast-pathed safe answer, needs-jason for a
+    gated one) so the next reader sees WHAT was tapped, not just that
+    something changed. ledger_lib.fold() has always understood a "note" event
+    (it is in validate_event's canonical set and cmd_proof already accepts
+    --note as a rider on a proof event) — this only adds the missing bare
+    CLI entry point for a note with no proof/status attached.
+    """
+    events = read_events()
+    records = fold(events)
+    if args.id not in records:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+    with ledger_lock():
+        append_event({
+            "ts": now_iso(),
+            "id": args.id,
+            "event": "note",
+            "note": args.text,
+        })
+    print(f"{args.id}: note added")
+    return 0
+
+
+def cmd_reviewed(args: argparse.Namespace) -> int:
+    """L-0791: mark an item's current schema_issues as reviewed, with a reason.
+
+    Clears them from the banner's "needs review" count only; fold() keeps
+    every issue on record, and any later bad event re-flags the item.
+    """
+    events = read_events()
+    records = fold(events)
+    rec = records.get(args.id)
+    if rec is None:
+        print(f"ledger: unknown id {args.id}", file=sys.stderr)
+        return 1
+    if not unreviewed_issues(rec):
+        print(f"ledger: {args.id} has no unreviewed schema issues; nothing to review", file=sys.stderr)
+        return 1
+    if not args.note.strip():
+        print("ledger: --note must say why the issues are settled", file=sys.stderr)
+        return 1
+    with ledger_lock():
+        append_event({
+            "ts": now_iso(),
+            "id": args.id,
+            "event": "reviewed",
+            "note": args.note,
+        })
+    print(f"{args.id}: {len(unreviewed_issues(rec))} schema issue(s) marked reviewed")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    records = fold(read_events())
+    items = sorted(records.values(), key=lambda r: r["id"])
+    if args.status:
+        items = [r for r in items if r["status"] == args.status]
+    if args.json:
+        print(json.dumps(items, indent=2, ensure_ascii=False))
+        return 0
+    if not items:
+        print("(no items)")
+        return 0
+    for r in items:
+        proof_flag = f" proof:{len(r['proof'])}" if r["proof"] else ""
+        ack_flag = " unacked" if r["asked_by"] == "jason" and not r["jason_ack"] and r["status"] == "done" else ""
+        print(f"{r['id']}  [{r['status']}]{proof_flag}{ack_flag}  {r['title']}  "
+              f"(owner: {r['owner']}, asked_by: {r['asked_by']})")
+    return 0
+
+
+def cmd_surface(args: argparse.Namespace) -> int:
+    records = fold(read_events())
+    lines = surface_lines(records)
+    if not lines:
+        print("(nothing to surface)")
+        return 0
+    for line in lines:
+        print(line)
+    return 0
+
+
+def cmd_banner(args: argparse.Namespace) -> int:
+    records = fold(read_events())
+    for line in banner_lines(records):
+        print(line)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ledger", description="Proof-backed open-items ledger.")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="Add a new item")
+    p_add.add_argument("title")
+    p_add.add_argument("--asked-by", choices=VALID_ASKED_BY, default="hub")
+    p_add.add_argument("--project", default=None)
+    p_add.add_argument("--owner", default=None)
+    p_add.set_defaults(func=cmd_add)
+
+    p_status = sub.add_parser("status", help="Change an item's status")
+    p_status.add_argument("id")
+    p_status.add_argument("new_status", choices=VALID_STATUSES)
+    p_status.set_defaults(func=cmd_status)
+
+    p_proof = sub.add_parser("proof", help="Attach proof to an item")
+    p_proof.add_argument("id")
+    p_proof.add_argument("type")
+    p_proof.add_argument("ref")
+    p_proof.add_argument("--note", default=None)
+    p_proof.set_defaults(func=cmd_proof)
+
+    p_ack = sub.add_parser("ack", help="the operator acknowledges an item")
+    p_ack.add_argument("id")
+    p_ack.set_defaults(func=cmd_ack)
+
+    p_claim = sub.add_parser("claim", help="Set an item's owner (you, or the named owner, now hold it)")
+    p_claim.add_argument("id")
+    p_claim.add_argument("owner")
+    p_claim.set_defaults(func=cmd_owner, action="claim")
+
+    p_release = sub.add_parser("release", help="Clear an item's owner back to unowned")
+    p_release.add_argument("id")
+    p_release.set_defaults(func=cmd_owner, action="release")
+
+    p_reassign = sub.add_parser("reassign", help="Hand an item's ownership to a different owner")
+    p_reassign.add_argument("id")
+    p_reassign.add_argument("owner")
+    p_reassign.set_defaults(func=cmd_owner, action="reassign")
+
+    p_note = sub.add_parser("note", help="Attach a free-text note to an item")
+    p_note.add_argument("id")
+    p_note.add_argument("text")
+    p_note.set_defaults(func=cmd_note)
+
+    p_reviewed = sub.add_parser("reviewed", help="Mark an item's schema issues reviewed (needs --note)")
+    p_reviewed.add_argument("id")
+    p_reviewed.add_argument("--note", required=True)
+    p_reviewed.set_defaults(func=cmd_reviewed)
+
+    p_list = sub.add_parser("list", help="List items")
+    p_list.add_argument("--status", choices=VALID_STATUSES, default=None)
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_surface = sub.add_parser("surface", help="Print items the nag policy says to raise now")
+    p_surface.set_defaults(func=cmd_surface)
+
+    p_banner = sub.add_parser("banner", help="Print the one-line status banner")
+    p_banner.set_defaults(func=cmd_banner)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

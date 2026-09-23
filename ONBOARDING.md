@@ -12,6 +12,12 @@ interactively — including a short interview so the config gets personalized to
 Both prompts tell Claude to double-check which situation you're actually in and switch if you
 picked wrong. Neither one ever pushes to a git remote.
 
+Prefer something scriptable and deterministic instead? Run `./install.sh` (or `./install.sh
+--merge` to install additively without touching anything you already have) — see the README's
+"Installing with the script" section. It does less personalization than the prompts below (no
+interview, no smart per-section CLAUDE.md merge) but never runs a model call to do the install
+itself.
+
 ---
 
 ## Variant A — fresh install
@@ -36,10 +42,14 @@ interview me where noted. Never push anything to any git remote.
    (one fact per file, typed frontmatter, indexed in MEMORY.md).
 5. Show me the commands/ list with one-line descriptions and let me drop any I won't use,
    then install my picks into ~/.claude/commands/. Keep /log, /index, and /tokens — those
-   three are the core of the system.
-6. Install hooks/ into ~/.claude/hooks/: chmod +x the shell hooks, replace <MEMORY_DIR> and
-   project-root placeholders, and merge the hook wiring from settings.example.json into
-   ~/.claude/settings.json. Pipe-test each hook with a fake payload and show me it firing.
+   three are the core of the system. Also install agents/ into ~/.claude/agents/ (the
+   plan → build → playtest → bug-gate workflow) and bin/ + fleet/ into ~/.claude/bin/ and
+   ~/.claude/fleet/ if I want the hub/peer-session pattern, chmod +x everything in both.
+6. Install hooks/ into ~/.claude/hooks/: chmod +x the shell/Python/JS hooks, replace
+   <MEMORY_DIR> and project-root placeholders, and merge the hook wiring from
+   settings.json.template into ~/.claude/settings.json. Create an empty
+   ~/.claude/hooks/safety-guard.local.json (`{"extra_catastrophic_patterns": []}`) if it
+   doesn't exist. Pipe-test each hook with a fake payload and show me it firing.
 7. For each project directory I named: create a CLAUDE.md codebase map at its root (the /index
    command you just installed describes the format). Touch nothing outside ~/.claude and those
    project directories without asking.
@@ -69,8 +79,9 @@ earlier one. Never push anything to any git remote.
    ~/.claude/hooks/ into a timestamped backup directory and tell me where it is.
 
 2. Clone the repo to a scratch directory and read its README.md. Then, for every tracked file
-   in the repo (each file under commands/, hooks/, CLAUDE.md.template, settings.example.json),
-   classify it against what I already have and show me a short table (file / category / note):
+   in the repo (each file under commands/, agents/, bin/, fleet/, hooks/, CLAUDE.md.template,
+   OPERATOR.md, settings.json.template), classify it against what I already have and show me a
+   short table (file / category / note):
    - MISSING — I have no file that corresponds to it. New adopt.
    - PREVIOUSLY ADOPTED — I already have a file that's recognizably an earlier copy of this
      same one (same name, same purpose, maybe with my own edits layered in). This is an update,

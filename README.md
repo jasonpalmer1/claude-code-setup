@@ -13,7 +13,27 @@ It's a template: copy what's useful, fill in the `<PLACEHOLDERS>`, delete the re
 
 **Setting it up for the first time?** Don't install by hand — [`ONBOARDING.md`](ONBOARDING.md)
 has two copy-paste prompts (fresh install, or merge into an existing setup) that make Claude
-Code itself perform the whole install, personalized to you via a short interview.
+Code itself perform the whole install, personalized to you via a short interview. There's also
+a scripted `install.sh` if you'd rather run something deterministic yourself — see
+"Installing with the script" below.
+
+## The two-file contract: OPERATOR.md + CLAUDE.md
+
+Everything here rests on a split between two files, both always-loaded:
+
+- **`OPERATOR.md`** is the AI-agnostic contract — how you want to be treated, what needs your
+  sign-off, the proof-not-claims standard, and your red lines. It's written so you could hand it
+  to a different AI tool entirely and only need to edit its one small "adapter" section at the
+  bottom. `CLAUDE.md`'s first line (`@OPERATOR.md`) is what pulls it into every session.
+- **`CLAUDE.md.template`** (→ your real `CLAUDE.md`) is the harness-specific "constitution" —
+  the memory-tier design, delegation rules, token economy, and hub mechanics that make the
+  contract above actually run inside Claude Code. `CLAUDE.md` in this repo's own root is a real,
+  filled-in worked example of the template, kept side by side so you can see the difference
+  between the design doc and a day-to-day copy.
+
+Edit `OPERATOR.md` first — it's the one with your name, your red lines, your approval default.
+`CLAUDE.md.template` mostly works as shipped; its placeholders are structural (a memory
+directory path), not personal.
 
 ## Running AI safely when you're not an engineer
 
@@ -106,20 +126,58 @@ audit end to end; a context accumulating for a week is not.
   - `inbox-capture.sh` (UserPromptSubmit) — ambient, secret-scrubbed raw capture of every prompt, as a fallback feed a memory-extraction sweep can diff against
   - `pattern-capture-check.sh` (SessionEnd) — logs whether your pattern journal (see the Memory autopilot section of `commands/hub.md`) gained a same-day entry, for a staleness nudge elsewhere to key off
   - `memory-activate.py` / `memory-graph-refresh.sh` / `memory-health-nag.py` — an optional evolution of the flat memory index into a small linked graph with spreading-activation retrieval (see "Memory graph" below)
+- **`agents/`** — the three-gate workflow as typed sub-agent definitions: `planner.md` (plan
+  before any new scope), `playtester.md` (user-perspective pass after a build), `bug-gate.md`
+  (correctness check on the exact diff before it ships), and `search-demand.md` (checks real
+  search demand before a new page/site). Spawn them with the Agent tool, one task each, model
+  stated explicitly every time.
+- **`bin/`** — small CLI helpers the hub/board pattern leans on: a session-lease pair
+  (`hub-claim`/`hub-who`, so two sessions never silently collide on one repo), a `ledger` CLI
+  over the token-ledger data, and `disk-guard` (a threshold check before anything that deletes
+  or frees disk space). Each ships with its own test file — run those after any edit.
+- **`fleet/`** — `spawn`/`run` plus `lib.sh`: the peer-session pattern from `CLAUDE.md.template`'s
+  "Peer sessions" section made concrete — launching a genuinely separate chat identity (not just
+  an in-session subagent) for a long-lived, independently-drivable lane of work.
 - **`templates/`** — drop-in file skeletons, e.g. `hub-board.md`, the empty board the One-Chat Hub reads and writes (see below).
 - **`routines/`** — templates for scheduled, headless Claude Code runs (a Monday portfolio-cockpit report, a weekly token review, a weekly `CLAUDE.md` bloat-surgery pass), example `launchd` job definitions, and notes on keeping tool grants narrow.
-- **`settings.example.json`** — how to register the hooks.
+- **`settings.json.template`** — how to register every hook in this kit, with a deliberately
+  minimal `permissions` block (nothing autonomous, no deploy permissions) — add your own as you
+  earn trust in a task. `settings.example.json` is kept as a smaller worked example of the same
+  idea for just the original four core hooks.
 
 ## Setup
 
 Hands-off path: paste a prompt from [`ONBOARDING.md`](ONBOARDING.md) and Claude does all of
-this for you. By hand:
+this for you — recommended, since it also personalizes the config via a short interview and
+can merge intelligently into an existing setup.
 
-1. Copy `CLAUDE.md.template` → `~/.claude/CLAUDE.md` and fill in the placeholders.
-2. Copy `commands/` → `~/.claude/commands/`, `hooks/` → `~/.claude/hooks/` (then `chmod +x` the shell hooks), and `routines/` → `~/.claude/routines/` if you want scheduled runs.
-3. Merge `settings.example.json` into `~/.claude/settings.json`, editing paths as needed.
-4. Create your memory directory and an empty `MEMORY.md` index inside it.
-5. Search-and-replace the placeholders: `<MEMORY_DIR>` (where memory files live) and adjust the watched project roots in `index-reminder.sh`.
+### Installing with the script
+
+If you'd rather run something deterministic yourself:
+
+```sh
+git clone https://github.com/jasonpalmer1/claude-code-setup.git
+cd claude-code-setup
+./install.sh                 # fresh install into ~/.claude
+./install.sh --merge         # additive: never overwrites a file you already have
+./install.sh --dest DIR      # install somewhere other than ~/.claude
+```
+
+It copies every file above into place, `chmod +x`'s the shell/Python/JS hooks, creates an
+empty memory directory (`MEMORY.md` + `ARCHIVE.md`), an empty hub board, an empty token ledger,
+and an empty `safety-guard.local.json` extension point — then prints exactly what it did **not**
+set up (no git remote, no deploy credentials, no autonomous permission mode). It asks exactly
+one question, with a scriptable default: run in auto mode (keeps going without asking, the
+default) or conservative (`--conservative`, asks before edits). It never touches a git remote
+and never installs anything that pushes on your behalf.
+
+### Installing by hand
+
+1. Copy `CLAUDE.md.template` → `~/.claude/CLAUDE.md` and `OPERATOR.md` → `~/.claude/OPERATOR.md`, then fill in the placeholders in both (see "The two-file contract" above).
+2. Copy `commands/`, `agents/`, `bin/`, `fleet/`, and `hooks/` → the matching directories under `~/.claude/`, then `chmod +x` the shell/Python/JS ones. Copy `routines/` too if you want scheduled runs.
+3. Copy `settings.json.template` → `~/.claude/settings.json`, editing paths/permissions as needed (or merge just the hook entries from it into a settings.json you already have).
+4. Create your memory directory and an empty `MEMORY.md` index inside it — the path is `~/.claude/projects/<your-home-path-with-slashes-replaced-by-dashes>/memory/`.
+5. Copy `templates/hub-board.md` → `~/.claude/hub/board.md` if you want the One-Chat Hub.
 
 ## Why it's built this way
 
@@ -156,9 +214,25 @@ The delegation rules above (state the model, cheap tier for read-shaped work) go
 
 Peer sessions need their own guardrails or they're easy to under-govern: every session-hygiene rule still applies to each one (a "long-lived lane" is a long-lived chat identity that logs and clears on its own cadence, never a context resumed for days on end); the autonomy tier travels with the *task*, not the session, so a permissive spawn can never be used to route around a permission the delegating session would itself be refused; and cost gets judged on the whole spawn tree, not session-by-session, which is what the parent-tagging feature in `hooks/token-ledger.py` is for. Full pattern in the "Peer sessions" section of `CLAUDE.md.template`.
 
-### Second machine
+### Installing on a second machine
 
-If you run Claude Code from more than one machine on the same account, the config in this repo (or your private fork of it) plus your memory directory can be kept in their own git repo and mirrored onto a second machine: a `SETUP.md` at the repo root that a fresh Claude Code session can follow step-by-step (clone the config over `~/.claude`, verify hooks fire, install anything not tracked in git like screenshot-testing binaries), a whitelist-style `.gitignore` (ignore everything, opt in `CLAUDE.md`/`settings.json`/`commands/`/`hooks/`/`templates/`/`routines/`/the memory tree explicitly, so caches, transcripts, and credentials never get swept in by accident), and username-agnostic paths throughout (`~`/`$HOME`, never a hardcoded home directory) so the same tracked files work under a different username with zero edits. The one machine-specific thing worth calling out: if your harness keys its per-project data directory off the OS username, bridge that with a local, untracked symlink rather than editing tracked paths per machine.
+If you run Claude Code from more than one machine on the same account, the fastest path is
+`install.sh --merge` from this repo (or your private fork of it) on the new machine — it's
+additive by design, so it never overwrites anything already there and just reports what it
+skipped. Two things make that safe across machines: every hook uses `$HOME`/`~`, never a
+hardcoded home directory, so the same tracked files work under a different username with zero
+edits; and `install.sh` only ever touches files under its own `--dest` (default `~/.claude`) —
+it never reaches into a project directory or installs anything machine-specific like
+screenshot-testing binaries (install those separately, same as any other dependency).
+
+If you keep your own fork with real customizations, the same idea works as a private git repo:
+mirror it onto the second machine, clone over `~/.claude` (or run `install.sh --merge` from it),
+verify hooks fire with a sample payload, and keep a whitelist-style `.gitignore` — ignore
+everything, opt in `CLAUDE.md`/`OPERATOR.md`/`settings.json`/`commands/`/`agents/`/`bin/`/
+`fleet/`/`hooks/`/`templates/`/`routines/`/the memory tree explicitly, so caches, transcripts,
+and credentials never get swept in by accident. The one machine-specific thing worth calling
+out: if your harness keys its per-project data directory off the OS username, bridge that with
+a local, untracked symlink rather than editing tracked paths per machine.
 
 ## One-Chat Hub
 

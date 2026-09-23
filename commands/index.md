@@ -19,4 +19,4 @@ Steps:
    - **Conventions** — anything a new session must know
 4. Store *what's true now and how it connects* — not a line-by-line dump. Keep it scannable.
 
-This is delegable work — if the project is large, hand it to a mid-tier subagent and tell it to read any existing `CLAUDE.md` first.
+This is delegable work — if the project is large, hand it to a Sonnet subagent and tell it to read any existing `CLAUDE.md` first.

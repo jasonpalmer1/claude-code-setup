@@ -1,20 +1,11 @@
 #!/bin/sh
-# SessionEnd hook — measures adherence to a "pattern journal" (see the Memory
-# autopilot section in commands/hub.md, if you're using that pattern): a
-# dated, accumulating log of recurring behavioral/strategic patterns you've
-# noticed, distinct from a static one-time summary of how you work.
-#
-# Writes one line per day to memory/pattern_adherence.log: HIT if the journal
-# gained a dated entry today, MISS otherwise. A later HIT the same day upgrades
-# that day's MISS — recovery counts. This is measurement only, not nagging —
-# pair it with a SessionStart hook (or a check in your own dashboard) that
-# reads this log and surfaces a nudge only when it's been stale for more than
-# a day or two, so the system observes constantly but only speaks up when
-# something's actually off.
-#
-# Customize MEM to your own memory directory (see <MEMORY_DIR> in
-# CLAUDE.md.template).
-MEM="$HOME/.claude/projects/<your-id>/memory"
+# SessionEnd: measure pattern-journal adherence (feedback_pattern_capture).
+# One line per day in memory/pattern_adherence.log: HIT if patterns_observed.md
+# gained a dated entry today, MISS otherwise. A later HIT upgrades the day's
+# MISS — recovery counts. This is measurement, not nagging: the SessionStart
+# stale banner (operator-scorecard.mjs) does the nudging, only when >2d stale.
+# Installed 2026-07-19 on the operator's explicit go, after his 2nd audit of the layer.
+MEM="$HOME/.claude/projects/$(printf '%s' "$HOME" | sed 's#/#-#g')/memory"
 J="$MEM/patterns_observed.md"
 LOG="$MEM/pattern_adherence.log"
 today=$(date +%Y-%m-%d)

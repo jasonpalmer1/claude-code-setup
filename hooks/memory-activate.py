@@ -1,32 +1,15 @@
 #!/usr/bin/env python3
 """SessionStart / UserPromptSubmit hook — spreading-activation memory retrieval.
 
-This is an optional evolution of the flat, index-only memory system described
-in CLAUDE.md.template's "Memory system" section. Instead of "load the whole
-index every turn," it activates seed nodes in a small memory GRAPH — a
-lightweight, typed-edge graph of links between your memory files — spreads
-across those edges, and injects a SHORT pointer block naming the handful of
-files most relevant to this session, plus any contradiction the graph knows
-about between two memories.
+Replaces "load the whole index every turn" with "activate what this moment needs".
+Given the session's cwd and opening prompt, it activates seed nodes in the memory
+graph, spreads across typed edges, and injects a SHORT pointer block naming the
+handful of memory files worth reading — plus any contradiction the graph knows about.
 
-This hook is the retrieval half only. It assumes you (or a subagent you task
-with it) maintain a small `graph/` toolset next to your memory files:
-  - `graph/build.py` — rebuilds `graph/graph.json` from your memory files'
-    frontmatter/links (see memory-graph-refresh.sh for the rebuild trigger).
-  - `graph/retrieve.py` — exposes `load(path)` and
-    `retrieve(graph, query, cwd, mode, k)` returning
-    `{"results": [{"id", "cluster", "description", "activation"}, ...],
-      "flags": [{"kind": "contradicts"|"superseded", "pair": [id, id]}, ...]}`.
-That engine isn't included here — it's a DIY layer once you have enough
-memory files that a flat index stops being enough. This hook is the scaffold
-that calls it.
+Fails open, always: if the graph is missing, stale, or the retrieval errors, this
+prints nothing and exits 0. A memory hook must never be able to block a session.
 
-Fails open, always: if the graph is missing, stale, or retrieval errors, this
-prints nothing and exits 0. A memory hook must never be able to block a
-session.
-
-Customize MEMORY_DIR to your own layout (see <MEMORY_DIR> in
-CLAUDE.md.template). Wire in settings.json:
+Wire in settings.json:
   {"hooks": {"SessionStart": [{"hooks": [
      {"type": "command", "command": "python3 ~/.claude/hooks/memory-activate.py"}]}]}}
 """
@@ -34,13 +17,21 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-# Customize: point this at your own memory directory, e.g. the layout from
-# CLAUDE.md.template's <MEMORY_DIR>.
-MEMORY_DIR = Path.home() / ".claude/projects/<your-id>/memory"
-GRAPH_DIR = MEMORY_DIR / "graph"
+
+def _home_memory_dir():
+    """~/.claude/projects/<home-slug>/memory -- the slug Claude Code
+    derives from the real $HOME path (str(Path.home()).replace('/', '-')),
+    computed at runtime so this hook works on any machine, not just the
+    one it was written on."""
+    slug = str(Path.home()).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / slug / "memory"
+
+
+GRAPH_DIR = _home_memory_dir() / "graph"
 K = 5
 MIN_ACTIVATION = 0.5     # below this it's noise; say nothing rather than guess
 STALE_DAYS = 14
@@ -76,14 +67,15 @@ def main() -> int:
     if not hits:
         return 0
 
-    # Don't re-surface what this session has already been shown. Without this
-    # the UserPromptSubmit path repeats the same pointer block every single
-    # turn, which is exactly the always-on context tax this system exists to
-    # remove.
+    # Don't re-surface what this session has already been shown. Without this the
+    # UserPromptSubmit path repeats the same pointer block every single turn,
+    # which is exactly the always-on context tax this system exists to remove.
     sid = payload.get("session_id") or "nosession"
     seen_path = Path(f"/tmp/claude-memact-{sid}.json")
     try:
         seen = set(json.loads(seen_path.read_text())) if seen_path.exists() else set()
+        if payload.get("hook_event_name") == "SessionStart":
+            seen = set()  # re-surface relevant pointers after resume/compaction
     except (json.JSONDecodeError, OSError):
         seen = set()
 
@@ -101,7 +93,8 @@ def main() -> int:
              "most relevant to this session. Read the ones you actually need — this is",
              "a pointer list, not loaded content.", ""]
     for h in hits:
-        desc = (h.get("description") or "").strip()
+        # L-0917 gate B1 (same hole as worker-lessons): no tag can open or close.
+        desc = (h.get("description") or "").strip().replace("<", "\u2039").replace(">", "\u203a")
         if len(desc) > 96:
             desc = desc[:93] + "..."
         lines.append(f"  · {h['id']}  [{h['cluster']}]")
