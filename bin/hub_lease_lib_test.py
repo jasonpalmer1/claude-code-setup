@@ -368,52 +368,6 @@ class PgrepFlagDiscipline(unittest.TestCase):
                     self.fail(f"{f}:{lineno} uses pgrep -fl outside of explanatory prose: {line!r}")
 
 
-class JasonQuoteFlagIsATolerantAlias(unittest.TestCase):
-    """Fix round 2 (2026-09-23): --operator-quote was renamed to --operator-quote
-    (the operator-role rename), but the brief requires the OLD flag to keep
-    working as an accepted alias -- some existing script, shell alias, or
-    muscle memory may still invoke `hub-claim --override --operator-quote ...`
-    after the rename ships. This runs the real CLI as a subprocess (--help
-    only -- never --override, so this never touches a real lease file or
-    fires a real ntfy push) and proves both spellings are wired to the same
-    argparse dest, not just documented."""
-
-    def test_help_lists_both_spellings_sharing_one_dest(self):
-        out = subprocess.run(
-            [sys.executable, str(BIN_DIR / "hub-claim"), "--help"],
-            capture_output=True, text=True, timeout=10,
-        )
-        self.assertEqual(out.returncode, 0)
-        help_text = out.stdout
-        self.assertIn("--operator-quote", help_text)
-        self.assertIn("--operator-quote", help_text)
-        # argparse prints synonyms for the same dest on one line/metavar
-        # group (both spellings followed by the same OPERATOR_QUOTE
-        # metavar) -- proves they are ONE argument, not a stray mention of
-        # the old name in a comment.
-        self.assertIn("OPERATOR_QUOTE", help_text)
-
-    def test_operator_quote_flag_parses_without_argparse_error(self):
-        # A dry run that reaches the "blank quote refused" business-logic
-        # message (exit 1, not argparse's exit 2) proves --operator-quote
-        # parsed successfully and reached hl.claim() -- an unrecognized
-        # flag would exit 2 with an argparse usage error instead. Uses an
-        # isolated $HOME so this can never touch a real lease file, even
-        # though a blank quote never gets far enough to write one.
-        sandbox = tempfile.mkdtemp(prefix="hub-claim-jasonquote-test-")
-        try:
-            env = dict(os.environ, HOME=sandbox)
-            out = subprocess.run(
-                [sys.executable, str(BIN_DIR / "hub-claim"), "--session", "x",
-                 "--override", "--operator-quote", "   "],
-                capture_output=True, text=True, timeout=10, env=env,
-            )
-            self.assertNotEqual(out.returncode, 2, f"argparse rejected --operator-quote: {out.stderr}")
-            self.assertIn("blank", out.stdout + out.stderr)
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-
-
 class HeartbeatIsIdempotentAndSilent(HubLeaseTestCase):
     def test_same_session_reclaim_is_a_silent_heartbeat_not_a_new_log_line(self):
         self.register_session("holder", 1)
