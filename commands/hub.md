@@ -71,7 +71,7 @@ ledger is durable.** State lives in `~/.claude/hub/ledger.jsonl`, the memory tie
 
 ## Intake, every ask gets a ledger id before any work
 
-`ledger add "<title>" --asked-by jason` runs before dispatch, before an inline answer that does
+`ledger add "<title>" --asked-by operator` runs before dispatch, before an inline answer that does
 real work, before anything. Nothing is worked without a ledger id, this replaces board-first.
 A pure question or opinion answered inline doesn't need one. `/checkpoint` and `/log` refuse to
 close while any ask made in this chat still has no ledger id, check `ledger list` against the
@@ -138,7 +138,7 @@ own prompts.
 
 1. Verify the report file exists, then `ledger proof <id> <type> <ref>`, then `ledger status
    <id> done` (the CLI itself refuses `done` without a proof event on record first).
-2. If `asked_by=jason`: the next reply carries a tappable ack (`AskUserQuestion`, the "confirm
+2. If `asked_by=operator`: the next reply carries a tappable ack (`AskUserQuestion`, the "confirm
    done" pattern), never a prose "done" claim.
 3. Act per the autonomy ladder: green (commit, push, deploy verified work) without asking,
    yellow (preview link), red (money, public, migrations) plan-first. `/preflight` before
