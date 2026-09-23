@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# run — internal. Executed inside the freshly-opened VS Code terminal by `spawn`.
+# Consumes the job file and hands the terminal over to Claude Code.
+FLEET="$HOME/.claude/fleet"
+job="$FLEET/jobs/$1.job"
+
+if [ ! -f "$job" ]; then
+  echo "fleet: no job named '$1' (already claimed?)"
+  exec "${SHELL:-/bin/zsh}" -l
+fi
+
+# shellcheck disable=SC1090
+. "$job"
+rm -f "$job"
+
+# shellcheck disable=SC1091
+. "$FLEET/lib.sh"
+
+printf '\033]0;%s\007' "$FLEET_NAME"          # name the tab
+cd "$FLEET_DIR" || exit 1
+
+# The repo lock's lifetime is THIS process's lifetime, not spawn's (spawn
+# already exited once the tab launched). Release it on every exit path —
+# normal exit, Ctrl-C, killed tab — so a finished session doesn't leave the
+# next spawn into this dir needing --steal.
+LOCKFILE="$(fleet_lock_path "$FLEET_DIR")"
+trap 'rm -f "$LOCKFILE"' EXIT INT TERM
+
+# ⚠ FIXED 2026-09-01. Locks were written by `spawn` with "pid":null and nothing ever filled
+# it in — so `reference_fleet_spawn.md` told operators to "holder-check first" before stealing
+# a lock, an instruction that could NEVER be followed. Consequence: no lock could ever be
+# judged stale, so they accumulated without bound (11 against a documented ceiling of 6 on the
+# day this was found). Same shape as four other bugs that day: a check that cannot come out
+# negative. spawn genuinely does not know the session PID (the session does not exist yet) --
+# but THIS process is the session, so stamp it here, where the answer is actually known.
+fleet_stamp_lock_pid "$LOCKFILE" "$$" 2>/dev/null || true
+
+# Threaded to the launched session so it can read its own fleet position:
+# depth (for its own spawn calls' recursion check) and parent (for the token
+# ledger's spend-tree rollup at SessionEnd).
+export CLAUDE_FLEET_DEPTH="${FLEET_DEPTH:-0}"
+export CLAUDE_FLEET_PARENT="${FLEET_PARENT:-unknown}"
+
+echo "── fleet: $FLEET_NAME ── $FLEET_DIR  (depth $CLAUDE_FLEET_DEPTH, parent ${CLAUDE_FLEET_PARENT:0:8}) ──"
+
+args=()
+[ -n "$FLEET_MODEL" ] && args+=(--model "$FLEET_MODEL")
+[ "${FLEET_AUTO:-0}" = 1 ] && args+=(--permission-mode acceptEdits)
+[ "${FLEET_RC:-0}" = 1 ] && args+=(--remote-control "$FLEET_NAME")
+[ -n "$FLEET_PROMPT" ] && args+=("$FLEET_PROMPT")
+
+# Not exec'd (deliberately, unlike before): exec would replace this process
+# image and skip the EXIT trap above, leaking the lock forever. Running it as
+# a normal foreground child costs nothing here — it's already the only thing
+# this terminal tab does — and the exit code is preserved either way.
+if [ "$FLEET_SHELL" = "1" ]; then
+  "${SHELL:-/bin/zsh}" -l
+  exit $?
+fi
+
+claude "${args[@]}"
+exit $?

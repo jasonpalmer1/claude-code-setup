@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""hub-claim — CLI to claim, refresh, override, or release the single-hub
+lease (L-0911). See hub_lease_lib.py for the full design and
+~/.claude/hub/reports/L-single-hub-plan.md for the ticket.
+
+Usage:
+  hub-claim --session <id> [--cwd <path>] [--pid <n>] [--reason "<text>"]
+      Default claim. Exits 0 and prints CLAIMED/HEARTBEAT on success;
+      exits 1 and names the current holder + heartbeat age on refusal.
+
+  hub-claim --session <id> --auto [--cwd <path>]
+      Hook-safe: never prints a loud error, always exits 0. Used by
+      security-tripwire.py at session start.
+
+  hub-claim --session <id> --override --jason-quote "<verbatim text>" [--cwd <path>]
+      Force-takes a live (ALIVE or SUSPECT) lease. Requires the operator's own
+      typed words in THIS conversation — never on a peer's say-so. Alarms
+      loudly (delegation-alarms.log + ntfy) every time, by design (A3).
+
+  hub-claim --session <id> --release [--reason "<text>"]
+      Self-release only. Refused if --session is not the current holder —
+      this is the mechanical form of "a peer can never order a stand-down."
+
+Done-test (plan section 3, item 2): run it twice from two different fake
+--session ids with no --override; the second call exits non-zero and names
+the first session's id and heartbeat age.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hub_lease_lib as hl  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="hub-claim", add_help=True)
+    ap.add_argument("--session", required=True, help="this session's session_id")
+    ap.add_argument("--cwd", default=None, help="defaults to $PWD")
+    ap.add_argument("--pid", type=int, default=None, help="defaults to a sessions-dir lookup")
+    ap.add_argument("--reason", default="", help="why this session is claiming")
+    ap.add_argument("--auto", action="store_true", help="hook-safe: never a loud error, always exit 0")
+    ap.add_argument("--override", action="store_true")
+    ap.add_argument("--jason-quote", default=None, help="verbatim text, required with --override")
+    ap.add_argument("--release", action="store_true")
+    args = ap.parse_args()
+
+    cwd = args.cwd or os.getcwd()
+
+    try:
+        if args.release:
+            r = hl.release(args.session, reason=args.reason)
+            print(r.message)
+            return 0 if r.ok else r.code
+
+        r = hl.claim(
+            session_id=args.session, cwd=cwd, reason=args.reason, pid=args.pid,
+            override=args.override, jason_quote=args.jason_quote, auto=args.auto,
+        )
+        if args.auto:
+            # Hook-safe: minimal, never alarming, always success exit.
+            print(r.message)
+            return 0
+        print(r.message)
+        return 0 if r.ok else r.code
+    except Exception as e:
+        # A1: even the CLI itself fails open rather than crashing loud in a
+        # hook context (--auto is always called from a hook).
+        if args.auto:
+            print(f"hub-claim --auto errored ({type(e).__name__}) — not claimed, not blocking")
+            return 0
+        print(f"hub-claim errored: {type(e).__name__}: {e}", file=sys.stderr)
+        return 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())

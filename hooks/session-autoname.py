@@ -2,33 +2,31 @@
 """
 session-autoname.py — UserPromptSubmit hook.
 
-Makes every Claude Code session name itself after what it's actually working
-on, so a session list shows "pricing-page-bug" instead of an opaque generated
-id. Useful once you routinely run more than one or two sessions at a time and
-telling them apart by name beats scrolling transcripts.
+Makes every Claude Code session name itself after what it's actually working on,
+so the phone list / Agent View / the HQ Fleet tab show "<product-b>-pricing" instead
+of "operator-d4".
+
+Built 2026-07-26 (switchboard Phase 2). the operator's original ask, verbatim:
+"they can dynamically name themselves".
 
 HOW IT WORKS
-  If your harness keeps a per-session registry file (e.g. one JSON file per
-  live session carrying {sessionId, name, nameSource, ...}) that a session
-  list command reads live, this hook renames the CURRENT session by rewriting
-  its own registry entry — no restart needed. Adjust SESSIONS_DIR and the
-  registry shape to whatever your harness actually exposes; the derive_name()
-  logic below is harness-agnostic.
+  Claude Code keeps one registry file per live session at ~/.claude/sessions/<pid>.json
+  carrying {sessionId, name, nameSource, ...}. `claude agents --json` reads straight
+  from those files — verified live 2026-07-26 by writing a name and seeing it appear
+  immediately, no restart. So the session renames itself by rewriting its own file.
 
-WHEN IT STAYS OUT OF THE WAY
-  - nameSource != "derived" -> you (or something else) renamed it already; a
-    manually-chosen name has no nameSource at all. Never overwrite a human's
-    choice.
+WHEN IT STAYS OUT OF THE WAY (all verified against real registry files)
+  - nameSource != "derived"  -> the operator renamed it himself (his manual "creative" session
+    has no nameSource at all). Never overwrite a human's choice.
   - the current name doesn't look auto-generated -> already named, leave it.
-    Auto names are assumed to look like "<something>-<2 hex>".
-  - slash commands, or a prompt with fewer than 2 real words left after filler
-    is stripped -> a name derived from "keep going on next steps" is worse
-    than none.
+    Auto names are "<something>-<2 hex>" (operator-d4, projects-ca).
+  - slash commands, or a prompt with fewer than 2 real words left after filler is
+    stripped -> a name derived from "keep going on next steps" is worse than none.
 
 SAFETY
-  Never throws, never blocks a prompt, never writes to stdout. UserPromptSubmit
-  stdout is injected into the model's context, so this printing anything would
-  silently pollute every single turn.
+  Never throws, never blocks a prompt, never writes to stdout. UserPromptSubmit stdout
+  is injected into the model's context, so this printing anything would silently
+  pollute every single turn.
 """
 
 import json
@@ -39,8 +37,7 @@ import tempfile
 
 SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
 
-# Auto-generated names look like "<prefix>-<2 hex>": myuser-d4, projects-ca.
-# Adjust this to match whatever shape your harness actually generates.
+# Auto-generated names look like "<prefix>-<2 hex>": operator-d4, projects-ca.
 AUTO_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*-[0-9a-f]{2}$", re.I)
 
 # Filler that carries no signal about what the session is DOING.
@@ -66,11 +63,11 @@ STOP = {
 MAX_WORDS = 3
 MAX_LEN = 28
 
-# UserPromptSubmit also fires for text the HARNESS injects, not just what you
-# typed: background-task completion notices, local-command output, system
-# reminders. Naming a session after one of those makes every such chat look
-# identical, which defeats the point of naming at all. Anything opening with
-# an XML-ish tag is assumed machine-authored.
+# UserPromptSubmit also fires for text the HARNESS injects, not just the operator typing:
+# background-task completion notices, local-command output, system reminders. Those
+# named 5 of his 7 live sessions "task-notification" on 2026-07-26 — every chat
+# looking identical is the exact problem this hook exists to solve. Anything opening
+# with an XML-ish tag is machine-authored; nothing the operator types starts with "<".
 SYSTEM_MARKERS = (
     "task-notification",
     "system-reminder",
@@ -79,10 +76,9 @@ SYSTEM_MARKERS = (
     "caveat:",
 )
 
-# Names a naming bug could plausibly produce before you notice and fix it.
-# Treated as overwritable so affected sessions self-heal on the next real
-# prompt — safer than reaching in and rewriting registry files that other
-# live processes may be actively holding.
+# Names produced by that bug before it was fixed. Treated as overwritable so the
+# affected sessions self-heal on the operator's next real prompt — safer than reaching in
+# and rewriting registry files that other live processes are actively holding.
 OVERWRITABLE = {"task-notification", "task-notification-agent", "local-command"}
 
 
@@ -155,7 +151,7 @@ def main():
     if not rec:
         return
 
-    # Only ever touch a name the harness generated. A human's name is final.
+    # Only ever touch a name Claude Code generated. A human's name is final.
     if rec.get("nameSource") != "derived":
         return
     current = rec.get("name") or ""
@@ -186,10 +182,10 @@ if __name__ == "__main__":
             "a web app I can deploy on a Cloudflare temporary link",
             "keep going on next steps and do as much as you can yourself",
             "/log",
-            "fix the pricing page so the checkout button works",
+            "fix the <product-b> pricing page so the buy button works",
             "yes",
-            "Can you please help me refactor the backtest engine?",
-            "<task-notification>Agent worker-1 completed</task-notification>",
+            "Can you please help me refactor the trading backtest engine?",
+            "<task-notification>Agent fleet-needs-you completed</task-notification>",
             "<local-command-caveat>Caveat: the messages below were generated",
             "Caveat: The messages below were generated by the user",
         ]

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """SessionStart hook — one-line nag when the memory-graph health check looks bad.
 
-Pairs with memory-graph-refresh.sh and memory-activate.py (see the latter's
-docstring for what the memory graph is). Reads only the LAST row of
-graph/health-history.jsonl — a file you'd write from your own graph/maintain.py
-health-check script — and prints a single short plain-English line ONLY when
+Reads only the LAST row of graph/health-history.jsonl (written by
+graph/maintain.py) and prints a single short plain-English line ONLY when
 something is actually wrong: open issues, a silent (null) benchmark, or a
 health check that hasn't run in over a week. Prints nothing when healthy —
 this is a nag, not a status dashboard.
@@ -12,9 +10,7 @@ this is a nag, not a status dashboard.
 Fails open, always: any error (missing file, bad JSON, whatever) means print
 nothing and exit 0. A memory hook must never be able to block a session.
 
-Customize MEMORY_DIR to your own layout (see <MEMORY_DIR> in
-CLAUDE.md.template). Wire in settings.json (this script does not register
-itself):
+Wire in settings.json (this script does not register itself):
   {"hooks": {"SessionStart": [{"hooks": [
      {"type": "command", "command": "python3 ~/.claude/hooks/memory-health-nag.py"}]}]}}
 """
@@ -25,9 +21,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Customize: point this at your own memory directory, e.g. the layout from
-# CLAUDE.md.template's <MEMORY_DIR>.
-HISTORY = Path.home() / ".claude/projects/<your-id>/memory/graph/health-history.jsonl"
+
+def _home_memory_dir():
+    """~/.claude/projects/<home-slug>/memory -- the slug Claude Code
+    derives from the real $HOME path (str(Path.home()).replace('/', '-')),
+    computed at runtime so this hook works on any machine, not just the
+    one it was written on."""
+    slug = str(Path.home()).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / slug / "memory"
+
+
+HISTORY = _home_memory_dir() / "graph/health-history.jsonl"
 STALE_DAYS = 8
 
 
@@ -70,5 +74,20 @@ def main() -> int:
     return 0
 
 
+def logging_coverage() -> None:
+    """Piggybacked 2026-09-02 so the logging-coverage line reaches every session
+    start WITHOUT editing settings.json, which hot-reloads into every running
+    session ([[feedback_never_edit_global_settings_live]]). Cached daily, so the
+    scan runs once a day, not once a session. Fails open like everything here."""
+    try:
+        import runpy
+        runpy.run_path(str(Path.home() / ".claude/hooks/log-coverage.py"),
+                       run_name="_coverage")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    logging_coverage()
+    sys.exit(rc)

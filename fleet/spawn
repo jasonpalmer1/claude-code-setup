@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# spawn — open a NEW terminal tab in the frontmost VS Code window and start a
+# Claude Code session in it.
+#
+#   spawn <name> -m <model> [-d <dir>] [-p "<opening prompt>"] [--split] [--shell]
+#              [--parent <session-id>] [--force-depth] [--steal] [--force]
+#              [--inherit-model] [--in-place]
+#
+# -m/--model is REQUIRED (2026-08-13): an unspecified model silently inherits
+# settings.json's main-loop tier — the most expensive one — instead of the
+# cheap tier the peer lane actually needs. Pick by task shape: haiku for
+# read-shaped lanes, sonnet for code/build lanes. Pass --inherit-model for the
+# rare deliberate case; it prints a one-line warning naming what it inherited.
+#
+# -d/--dir targeting a git repo lands the session in a PER-LANE WORKTREE, not
+# the repo root (2026-09-03, hub/strategy/fleet-folder-policy-2026-09-03.md):
+# <repo>-wt/<name> on branch lane/<name> off origin/main, created if absent,
+# reused if it already exists and is free. The root stays reserved for the
+# hub's own merges/deploys. Pass --in-place to run directly in the root
+# anyway (prints what that gives up); a non-git dir is unaffected either way.
+#
+# Examples:
+#   spawn <product-b> -d ~/projects/<product-b> -m sonnet -p "read CLAUDE.md and summarize"
+#   spawn scratch -m haiku --split
+#
+# Mechanics: writes a job file, then drives VS Code via AppleScript
+# (new terminal -> paste a one-line launcher -> Enter). Needs Accessibility
+# permission for VS Code once (System Settings > Privacy & Security > Accessibility).
+#
+# Guardrails (2026-08-09 spawn safety audit, extended 2026-09-03 — logic lives
+# in lib.sh, testable standalone without ever driving VS Code):
+#   depth    — a peer (depth 1) spawning another peer would be depth 2, silent
+#              recursion; refused unless --force-depth.
+#   worktree — a git repo target resolves to a per-lane worktree before the
+#              lock below ever sees it (see -d note above); --in-place opts out.
+#   lock     — LIVENESS-based (2026-09-03, replaced a TTL check that let a
+#              spawn overwrite a lock whose owning session was still running):
+#              refuses to spawn into a dir whose owning pid is confirmed
+#              alive; --steal takes it over (loud if the owner is provably
+#              alive). Released by `run`'s EXIT trap when that process ends,
+#              and reclaimed automatically once fleet_lock_alive confirms the
+#              owner is gone.
+#   ceiling  — refuses past 6 fresh locks at once; --force overrides.
+#   parent   — this job's spawning session id is threaded through so the token
+#              ledger can roll up spend across a whole spawn tree, not just
+#              per-session.
+set -euo pipefail
+
+FLEET="$HOME/.claude/fleet"
+JOBS="$FLEET/jobs"
+mkdir -p "$JOBS"
+# shellcheck disable=SC1091
+. "$FLEET/lib.sh"
+
+name=""; dir="$PWD"; model=""; prompt=""; split=0; shell_only=0; auto=0; rc=0
+parent=""; force_depth=0; steal=0; force=0; inherit_model=0; in_place=0
+
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--dir)         dir="$2"; shift 2 ;;
+    -m|--model)       model="$2"; shift 2 ;;
+    -p|--prompt)      prompt="$2"; shift 2 ;;
+    --split)          split=1; shift ;;
+    --auto)           auto=1; shift ;;   # launch with --permission-mode acceptEdits
+    --rc)             rc=1; shift ;;     # launch with --remote-control <name> (phone-drivable)
+    --shell)          shell_only=1; shift ;;
+    --parent)         parent="$2"; shift 2 ;;   # spawning session's id (for ledger rollup)
+    --force-depth)    force_depth=1; shift ;;   # allow a peer-of-a-peer (depth >= 2)
+    --steal)          steal=1; shift ;;         # take over a fresh lock on the target dir
+    --force)          force=1; shift ;;         # override the concurrent-ceiling refusal
+    --inherit-model)  inherit_model=1; shift ;; # deliberate opt-out of the -m requirement
+    --in-place)       in_place=1; shift ;;      # opt out of the per-lane worktree (2026-09-03)
+    -h|--help)        usage 0 ;;
+    -*)               echo "spawn: unknown flag $1" >&2; usage 1 ;;
+    *)                if [ -z "$name" ]; then name="$1"; else prompt="$1"; fi; shift ;;
+  esac
+done
+
+[ -n "$name" ] || { echo "spawn: need a name" >&2; usage 1; }
+case "$name" in *[!A-Za-z0-9_-]*) echo "spawn: name must be [A-Za-z0-9_-]" >&2; exit 1 ;; esac
+
+dir="${dir/#\~/$HOME}"
+[ -d "$dir" ] || { echo "spawn: no such dir: $dir" >&2; exit 1; }
+dir="$(cd "$dir" && pwd)"
+
+# --- per-lane worktree -----------------------------------------------------
+# Must run before the lock check below and before the name-uniquification loop
+# further down — the lock protects a DIRECTORY, and the whole point of this
+# block is that a lane's directory is never the repo root two sessions could
+# otherwise share (see header + fleet_resolve_worktree in lib.sh for why).
+# Uses $name as given on the command line, not any later-uniquified job-file
+# name, so retries under the same lane name land back in the same worktree.
+resolved_dir="$(fleet_resolve_worktree "$dir" "$name" "$in_place")" || exit 1
+dir="$resolved_dir"
+
+# --- refuse to inherit a model --------------------------------------------
+# Must run after arg parsing but before any side effect (job file, lock,
+# AppleScript) below. settings.json's top-level "model" is the main-loop
+# tier (currently opus) — silently booting a peer session on it is the
+# 2026-08-13 cost bug this closes. --inherit-model is the deliberate escape
+# hatch; it still has to name what it's inheriting, read live so this
+# warning can't go stale if settings.json's default ever changes.
+if [ -z "$model" ]; then
+  if [ "$inherit_model" = 1 ]; then
+    settings_model="$(jq -r '.model // "unset"' "$HOME/.claude/settings.json" 2>/dev/null)"
+    [ -n "$settings_model" ] || settings_model="unset"
+    echo "spawn: ⚠ --inherit-model — no -m given, this session will inherit '$settings_model' from settings.json." >&2
+  else
+    echo "spawn: refused — no model given. Pass -m <model>: haiku for read-shaped lanes," \
+         "sonnet for code/build lanes. An unspecified model silently inherits settings.json's" \
+         "main-loop tier (currently opus) — the most expensive one. Pass --inherit-model if" \
+         "that's really what you want." >&2
+    exit 1
+  fi
+fi
+
+# --- guardrails --------------------------------------------------------------
+caller_depth="${CLAUDE_FLEET_DEPTH:-0}"
+new_depth="$(fleet_check_depth "$caller_depth" "$force_depth")" || exit 1
+
+[ -n "$parent" ] || parent="${CLAUDE_SESSION_ID:-unknown}"
+
+lockfile="$(fleet_lock_path "$dir")"
+fleet_check_lock "$lockfile" "$steal" >/dev/null || exit 1
+
+fleet_check_ceiling "$force" >/dev/null || exit 1
+
+# unique tab name
+base="$name"; n=2
+while [ -e "$JOBS/$name.job" ]; do name="$base-$n"; n=$((n+1)); done
+
+# job file consumed by ~/.claude/fleet/run
+{
+  printf 'FLEET_NAME=%q\n'   "$name"
+  printf 'FLEET_DIR=%q\n'    "$dir"
+  printf 'FLEET_MODEL=%q\n'  "$model"
+  printf 'FLEET_PROMPT=%q\n' "$prompt"
+  printf 'FLEET_AUTO=%q\n'   "$auto"
+  printf 'FLEET_RC=%q\n'     "$rc"
+  printf 'FLEET_SHELL=%q\n'  "$shell_only"
+  printf 'FLEET_DEPTH=%q\n'  "$new_depth"
+  printf 'FLEET_PARENT=%q\n' "$parent"
+} > "$JOBS/$name.job"
+
+# Claim the dir now, before driving VS Code — this is the mutex. `run` removes
+# it (via trap) when the launched session's process exits; if the launch
+# itself fails below, we remove it here instead so a dead spawn never leaves
+# the dir permanently locked.
+fleet_write_lock "$lockfile" "$dir" "$name"
+
+launcher="$FLEET/run $name"
+
+# --- drive VS Code -----------------------------------------------------------
+prev_clip="$(pbpaste 2>/dev/null || true)"
+printf '%s' "$launcher" | pbcopy
+
+newterm_key='keystroke "`" using {control down, shift down}'
+[ "$split" = 1 ] && newterm_key='keystroke "5" using {command down}'
+
+osascript <<APPLESCRIPT >/dev/null
+tell application "Visual Studio Code" to activate
+tell application "System Events"
+    repeat 40 times
+        if (name of first process whose frontmost is true) is "Code" then exit repeat
+        delay 0.25
+    end repeat
+    delay 0.4
+    $newterm_key
+    delay 1.2
+    keystroke "v" using {command down}
+    delay 0.3
+    key code 36
+end tell
+APPLESCRIPT
+
+sleep 0.6
+printf '%s' "$prev_clip" | pbcopy 2>/dev/null || true
+
+# verify the new tab actually claimed its job (run deletes the file on claim)
+# 90 x 0.5s = ~45s. Widened from 10s on 2026-08-10 (the operator's go): slow-booting sessions were
+# declared dead at 10s, and deleting the job file orphaned them permanently — the tab came
+# up with nothing to claim and the spawner reported a misleading "focus race" error.
+for _ in $(seq 1 90); do
+  [ ! -e "$JOBS/$name.job" ] && break
+  sleep 0.5
+done
+if [ -e "$JOBS/$name.job" ]; then
+  # Do NOT delete the job file — a still-booting tab can claim it late and self-recover.
+  # Release only the lock so a retry isn't blocked.
+  rm -f "$lockfile"
+  echo "spawn: UNCONFIRMED — no claim from '$name' within 45s; job file left in place at $JOBS/$name.job so a slow tab can still claim it. Check VS Code before respawning." >&2
+  exit 1
+fi
+
+echo "spawned+verified: $name  ->  $dir${model:+  [$model]}  (depth $new_depth, parent ${parent:0:8})"
+[ -n "$prompt" ] && echo "  opening prompt: $prompt"
+exit 0
