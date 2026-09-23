@@ -13,7 +13,7 @@ Steps:
 
 1. **Detect the project + its deploy method** by reading `package.json` (+ any `wrangler.*`, `next.config.*`, `.github/workflows/`). Three patterns exist in his fleet:
    - **A — npm deploy scripts** (e.g. `our-place`): `deploy:preview` / `deploy:prod` already wrap `wrangler pages deploy dist --branch preview|main`. Use them verbatim.
-   - **B — manual wrangler, no script** (e.g. `jasonwpalmer-com`: Next.js `output: "export"` → `out/`): build, then `wrangler pages deploy out --project-name <name> --branch preview` (or `--branch main` for prod). ⚠️ `jasonwpalmer-com` is the public site → 🔴 red: do not `--prod` without explicit sign-off.
+   - **B — manual wrangler, no script** (e.g. `<your-domain>`: Next.js `output: "export"` → `out/`): build, then `wrangler pages deploy out --project-name <name> --branch preview` (or `--branch main` for prod). ⚠️ `<your-domain>` is the public site → 🔴 red: do not `--prod` without explicit sign-off.
    - **C — laptop deploy scripts (<product-a> and <product-b>):** inspect the current project contract and cron worktree first. <product-a> uses `scripts/deploy-prod.sh`; <product-b> uses the sanctioned `scripts/nightly-local.sh deploy-only` from its clean, synced cron checkout. GitHub Actions do not deploy these sites. Never fall back to manual wrangler from another checkout. Preserve the project's push-before-deploy and regenerated-data rules. A push can be picked up by the next scheduled deployment, so it is production scope.
 
 

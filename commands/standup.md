@@ -33,7 +33,7 @@ Steps:
 2. **Infer one suggested next action per project** — terse, imperative, and **DEPLOY-AWARE**. Deploy models differ (see the `reference_deploy_mechanisms` memory / `~/projects/CONVENTIONS.md`):
    - **our-place** — git push is neutral; deploy is the explicit `/ship` step.
    - **<product-a> and <product-b>** — approved laptop scripts deploy from their designated checkout; scheduled jobs consume origin/main, so a push may ship at the next tick. Never describe GitHub Actions as their deployment path. For WIP suggest an isolated branch; for a release follow the current project contract and script.
-   - **jasonwpalmer-com** — verify the current deployment contract before recommending any push; do not infer its mechanism from another project.
+   - **<your-domain>** — verify the current deployment contract before recommending any push; do not infer its mechanism from another project.
 
    Mapping:
    - uncommitted changes → `commit WIP (N files)` (committing is safe — it does not deploy)
