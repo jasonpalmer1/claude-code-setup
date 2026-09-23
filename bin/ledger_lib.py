@@ -22,9 +22,18 @@ from pathlib import Path
 # fresh process, so there's no staleness risk.
 LEDGER_PATH = Path(os.environ.get("LEDGER_PATH") or (Path.home() / ".claude/hub/ledger.jsonl"))
 LOCK_PATH = Path(str(LEDGER_PATH) + ".lock")
-VALID_STATUSES = ("open", "active", "needs-jason", "done", "dropped")
-VALID_ASKED_BY = ("jason", "hub", "worker")
+VALID_STATUSES = ("open", "active", "needs-operator", "done", "dropped")
+VALID_ASKED_BY = ("operator", "hub", "worker")
 STALE_HOURS = 48
+
+# Tolerant reading (rename, 2026-09-23): this tool used to spell the human
+# operator's role literally as "operator" in a handful of field/status names
+# (asked_by, the needs-operator status, the operator_ack ack field). Renamed to the
+# generic role so this ledger tool works for anyone who installs it, not just
+# one person. Every OLD line already appended to a real ledger.jsonl before
+# this rename must still fold correctly -- these aliases are read-only
+# compatibility, never written by any code from here on.
+_LEGACY_ASKED_BY_ALIASES = {"operator": "operator"}
 
 # A3 (L-0763 hub audit, fixed 2026-09-22): fold() appends every `proof` event
 # to rec["proof"] regardless of `type`, and the done-gate in `ledger`'s
@@ -223,7 +232,21 @@ def next_id(events: list[dict]) -> str:
 
 def normalize_status(value):
     value = str(value or "").lower().replace("_", "-")
-    return {"working": "active", "in-progress": "active", "planning": "active"}.get(value, value)
+    return {
+        "working": "active", "in-progress": "active", "planning": "active",
+        # Tolerant reading (rename, 2026-09-23): any status literally
+        # recorded as "needs-operator" in an existing ledger.jsonl line folds
+        # to the current name, never written under the old name again.
+        "needs-operator": "needs-operator",
+    }.get(value, value)
+
+
+def normalize_asked_by(value):
+    """Tolerant reading (rename, 2026-09-23): an existing ledger line may
+    still carry the old literal "operator" asked_by value; fold it to the
+    current generic role so callers never have to special-case the old
+    spelling."""
+    return _LEGACY_ASKED_BY_ALIASES.get(str(value or "").lower(), value)
 
 
 def validate_event(event):
@@ -257,7 +280,7 @@ def fold(events: list[dict]) -> dict[str, dict]:
         rec = records.setdefault(eid, {
             "id": eid, "title": "", "status": "open", "asked_on": None,
             "asked_by": "hub", "owner": "unowned", "trigger": "", "project": None,
-            "proof": [], "last_surfaced": None, "jason_ack": False,
+            "proof": [], "last_surfaced": None, "operator_ack": False,
             "created_at": None, "updated_at": None, "notes": [], "decisions": [],
             "schema_issues": [], "reviewed_upto": 0,
         })
@@ -268,7 +291,7 @@ def fold(events: list[dict]) -> dict[str, dict]:
             # an older colliding task's completion/proof to the new task.
             rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "reused id; older task remains in raw history"})
             rec.update(title="", status="open", project=None, proof=[], notes=[], decisions=[],
-                       jason_ack=False, created_at=None, updated_at=None, owner="unowned")
+                       operator_ack=False, created_at=None, updated_at=None, owner="unowned")
         if rec["project"] and e.get("project") and rec["project"] != e["project"]:
             rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "cross-project id; event retained in raw ledger, not applied"})
             continue
@@ -280,11 +303,19 @@ def fold(events: list[dict]) -> dict[str, dict]:
             rec["title"] = title
             rec["created_at"] = rec["created_at"] or ts
             for field in ("asked_by", "asked_on", "owner", "trigger", "project"):
-                if e.get(field) is not None: rec[field] = e[field]
+                if e.get(field) is not None:
+                    rec[field] = normalize_asked_by(e[field]) if field == "asked_by" else e[field]
             if ev == "ask" and normalize_status(e.get("status")) in VALID_STATUSES:
                 rec["status"] = normalize_status(e["status"])
-        elif ev in ("status", "done", "needs_jason") or (ev is None and e.get("status")):
-            status = normalize_status(e.get("status") or {"done": "done", "needs_jason": "needs-jason"}.get(ev))
+        elif ev in ("status", "done", "needs_operator", "needs_operator") or (ev is None and e.get("status")):
+            status = normalize_status(e.get("status") or {
+                "done": "done",
+                # "needs_operator" is the old (pre-rename) event-name spelling;
+                # "needs_operator" is the current one. Both fold to the same
+                # current status name -- see normalize_status()'s own
+                # "needs-operator" alias for the equivalent literal-status form.
+                "needs_operator": "needs-operator", "needs_operator": "needs-operator",
+            }.get(ev))
             if status not in VALID_STATUSES:
                 rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "invalid status"})
                 continue
@@ -295,7 +326,9 @@ def fold(events: list[dict]) -> dict[str, dict]:
         elif ev == "proof":
             if e.get("proof"): rec["proof"].append(e["proof"])
         elif ev == "ack":
-            rec["jason_ack"] = bool(e.get("jason_ack", True))
+            # Tolerant reading: an old ack event recorded "operator_ack"; a
+            # current one records "operator_ack". Either satisfies this.
+            rec["operator_ack"] = bool(e.get("operator_ack", e.get("operator_ack", True)))
         elif ev == "surfaced":
             rec["last_surfaced"] = ts
         elif ev == "owner":
@@ -323,7 +356,7 @@ def fold(events: list[dict]) -> dict[str, dict]:
             if e.get("proof"): rec["proof"].append(e["proof"])
             if ev == "closed":
                 rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "closed is ambiguous: done or dropped; explicit status needed"})
-            if ev == "answered" and rec["status"] == "needs-jason":
+            if ev == "answered" and rec["status"] == "needs-operator":
                 rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "answer retained; explicit next status needed"})
         else:
             rec["schema_issues"].append({"ts": ts, "event": ev, "reason": "unsupported event"})
@@ -345,17 +378,17 @@ def needs_you(rec: dict) -> bool:
     """True only when the operator's own input is genuinely required to proceed.
 
     L-0377(a): this used to also fire for status == "done" with
-    asked_by == "jason" and no `ack` event -- the rubber-stamp rule
+    asked_by == "operator" and no `ack` event -- the rubber-stamp rule
     OPERATOR.md abolished 2026-09-15 ("finished internal work is not a
     decision"). bin/status's classify() already dropped that bucket
     (commit 62fa024, L-0372); this brings ledger_lib's needs_you() /
     banner_lines() / surface_lines() -- which back `ledger banner`,
     `ledger surface`, and the UserPromptSubmit hook that runs on every
     prompt in every live session -- into line with the same rule. An
-    `ack` is still recorded when it happens (rec["jason_ack"]), it just
+    `ack` is still recorded when it happens (rec["operator_ack"]), it just
     never gates this or any other display bucket again.
     """
-    return rec["status"] == "needs-jason"
+    return rec["status"] == "needs-operator"
 
 
 _IMPORTED_NOTE_TITLE_RE = re.compile(
@@ -393,7 +426,7 @@ def is_imported_board_note(rec: dict) -> bool:
     Narrow by design: this only ever gates the STALE-48h+ line in
     surface_lines() below. It never changes status, never edits or removes
     an event -- the ledger stays append-only either way -- and it leaves
-    needs-jason handling for imported lines untouched.
+    needs-operator handling for imported lines untouched.
     """
     return bool(_IMPORTED_NOTE_TITLE_RE.match(rec.get("title") or ""))
 
@@ -421,7 +454,7 @@ def banner_lines(records: dict[str, dict]) -> list[str]:
     from the exact same fold, never composed separately from memory.
     """
     items = list(records.values())
-    open_n = sum(1 for r in items if r["status"] in ("open", "active", "needs-jason"))
+    open_n = sum(1 for r in items if r["status"] in ("open", "active", "needs-operator"))
     needs_you_n = sum(1 for r in items if needs_you(r))
     working_n = sum(1 for r in items if r["status"] == "active")
     lines = [f"Open: {open_n} · Needs you: {needs_you_n}"]
@@ -434,16 +467,16 @@ def banner_lines(records: dict[str, dict]) -> list[str]:
 def surface_lines(records: dict[str, dict], limit: int = MAX_SURFACE) -> list[str]:
     """Items the nag policy says to raise now, one line each, capped at `limit`.
 
-    Priority order: needs-jason, then done-but-unacked jason asks, then
-    48h-stale open/active items, then jason asks never started.
+    Priority order: needs-operator, then done-but-unacked operator asks, then
+    48h-stale open/active items, then operator asks never started.
     """
     items = sorted(records.values(), key=lambda r: r["id"])
     printed: set[str] = set()
     lines: list[str] = []
 
     for r in items:
-        if r["status"] == "needs-jason" and r["id"] not in printed:
-            lines.append(f"NEEDS-JASON {r['id']}: {r['title']} (owner: {r['owner']})")
+        if r["status"] == "needs-operator" and r["id"] not in printed:
+            lines.append(f"NEEDS-OPERATOR {r['id']}: {r['title']} (owner: {r['owner']})")
             printed.add(r["id"])
 
     # L-0377(a): no CONFIRM/rubber-stamp block here -- a done ticket with no
@@ -459,7 +492,7 @@ def surface_lines(records: dict[str, dict], limit: int = MAX_SURFACE) -> list[st
     for r in items:
         if r["id"] in printed:
             continue
-        if r["asked_by"] == "jason" and r["status"] == "open":
+        if r["asked_by"] == "operator" and r["status"] == "open":
             lines.append(f"NEVER-STARTED {r['id']}: {r['title']} (asked {r['asked_on']})")
             printed.add(r["id"])
 

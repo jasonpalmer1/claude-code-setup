@@ -34,18 +34,20 @@ LOG = os.path.expanduser("~/.claude/hub/mcp-guard.log")
 # reference_mcp_usage_rules.md Tier 🚨, written 2026-08-09 from the live
 # connector inventory that day, widened 2026-09-16 (guard-fixes item 4).
 #
-# decision "block" = unchanged behavior for all 10 original entries: exit 2,
-# the CLAUDE_MCP_GUARD_ALLOW=1 bypass still applies, zero regression. Hub
-# audit amendment A3 (2026-09-16): converting these to "ask" was REJECTED —
-# red line 1 requires the operator to TYPE the go-ahead having seen the total and
-# destination first; a permission-prompt tap is weaker. These stay "block"
-# exactly as before, permanently, not just for this build.
-#
-# decision "ask" = new: emits the PreToolUse ask JSON, exit 0 (the harness
-# itself prompts the operator; no env-var bypass needed). Gmail send/reply/forward,
-# Drive share_file, and the After Hours public post are literally the
-# connector categories reference_mcp_usage_rules.md already calls "needs his
-# go" but had zero technical backstop before this.
+# decision "block" = the ONLY decision this file emits. the operator, 2026-09-23,
+# verbatim: "Several chats have still been asking me to approve commands.
+# make sure this doesn't happen again. they are all approved forever.
+# period." No hook may pop a permission prompt for him — that includes the
+# PreToolUse "ask" JSON (harness-level tap-to-approve), not just a chat
+# typing a question. Every entry that used to be decision "ask" (Gmail
+# send/reply/forward, Drive share_file, the After Hours public post, Notion
+# delete/move — added 2026-09-16 guard-fixes item 4, hub audit A3 reserved
+# "ask" for exactly these) is now "block" with a per-action redirect (see
+# REDIRECT below): the call is refused and told what to do instead — draft
+# it, tell the hub, wait for the operator's own go — never left waiting on a tap.
+# Blocking tightens this guard; it never loosens it. The original 10
+# money-moving/destructive entries were already "block" (hub audit A3,
+# 2026-09-16) and are unchanged.
 RED_TIER = (
     ("stripe", "create_refund", "block"),
     ("stripe", "stripe_api_write", "block"),
@@ -62,14 +64,34 @@ RED_TIER = (
     ("cloudflare", "r2_bucket_delete", "block"),
     ("cloudflare", "kv_namespace_delete", "block"),
     ("calendly", "cancel_event", "block"),
-    ("gmail", "send_message", "ask"),
-    ("gmail", "reply", "ask"),
-    ("gmail", "forward", "ask"),
-    ("drive", "share_file", "ask"),
-    ("<community-project>", "post_find", "ask"),
-    ("notion", "delete", "ask"),
-    ("notion", "move", "ask"),
+    ("gmail", "send_message", "block"),
+    ("gmail", "reply", "block"),
+    ("gmail", "forward", "block"),
+    ("drive", "share_file", "block"),
+    ("<community-project>", "post_find", "block"),
+    ("notion", "delete", "block"),
+    ("notion", "move", "block"),
 )
+
+# Per-(server, action) redirect appended to the block message — what to do
+# INSTEAD, so refusing never becomes a dead end. Only the 2026-09-16-item-4
+# entries (formerly "ask") and the destructive-SQL keyword check get a
+# specific redirect; the original 10 money-moving/destructive entries fall
+# back to block_message()'s generic tail (get the operator's explicit go, or the
+# CLAUDE_MCP_GUARD_ALLOW=1 bypass after that go).
+REDIRECT = {
+    ("gmail", "send_message"): "create a Gmail draft instead; the operator sends it himself.",
+    ("gmail", "reply"): "create a Gmail draft instead; the operator sends it himself.",
+    ("gmail", "forward"): "create a Gmail draft instead; the operator sends it himself.",
+    ("drive", "share_file"): "tell the hub which file and who; the operator shares it.",
+    ("<community-project>", "post_find"): "public post needs the operator's own go.",
+    ("notion", "delete"): "tell the hub.",
+    ("notion", "move"): "tell the hub.",
+    ("supabase", "destructive-sql"): (
+        "tell the hub which project/branch and paste the exact statement; "
+        "the operator reviews and applies it himself, or gives explicit go from the hub."
+    ),
+}
 
 # Supabase execute_sql/apply_migration + a destructive keyword (2026-09-16
 # guard-fixes item 4): a keyword classifier, not a SQL parser — this narrows
@@ -101,30 +123,19 @@ def log(line):
 
 
 def block_message(tool_name, server, action):
+    redirect = REDIRECT.get((server, action))
+    tail = redirect if redirect else (
+        "If he has already said go for this exact action, get his explicit "
+        "confirmation in this conversation, or re-run this call with "
+        "CLAUDE_MCP_GUARD_ALLOW=1 set for this process only after that confirmation."
+    )
     return (
         f"Blocked (MCP red-tier guard, reference_mcp_usage_rules.md Tier 🚨): "
         f"'{tool_name}' matches the {server}/{action} rule — money-moving, mass-outbound, "
-        "or destructive. This needs the operator's explicit per-action go IN THIS CONVERSATION "
-        "(the exact target and amount/recipients shown to him first), is never covered by "
-        "a standing grant, and is never delegated to a subagent. If he has already said go "
-        "for this exact action, ask him to confirm once more here, or re-run this call with "
-        "CLAUDE_MCP_GUARD_ALLOW=1 set for this process only after that confirmation."
+        "publishing, or destructive. This needs the operator's own action, is never covered by "
+        "a standing grant, and is never delegated to a subagent. No chat ever asks him for "
+        "permission via a prompt (the operator, 2026-09-23) — instead: " + tail
     )
-
-
-def _ask(tool_name, server, action):
-    reason = (
-        f"'{tool_name}' matches the {server}/{action} rule "
-        "(reference_mcp_usage_rules.md Tier 🚨/⚠) — mass-outbound, publishes, or a "
-        "destructive-shaped action. Confirm this is intended before it goes out."
-    )
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "ask",
-            "permissionDecisionReason": reason,
-        }
-    }))
 
 
 def run_hook():
@@ -150,9 +161,12 @@ def run_hook():
     if "supabase" in tool_l and ("execute_sql" in tool_l or "apply_migration" in tool_l):
         sql = str(tin.get("query") or tin.get("migration") or tin.get("sql") or "")
         if DESTRUCTIVE_SQL.search(sql):
-            log(f"ASK {tool} (rule=supabase/destructive-sql)")
-            _ask(tool, "supabase", "destructive-sql")
-            sys.exit(0)
+            if os.environ.get("CLAUDE_MCP_GUARD_ALLOW") == "1":
+                log(f"BYPASSED {tool} (rule=supabase/destructive-sql) via CLAUDE_MCP_GUARD_ALLOW=1")
+                sys.exit(0)
+            log(f"BLOCKED {tool} (rule=supabase/destructive-sql)")
+            print(block_message(tool, "supabase", "destructive-sql"), file=sys.stderr)
+            sys.exit(2)
 
     rule = matched_rule(tool)
     if not rule:
@@ -160,13 +174,8 @@ def run_hook():
 
     server, action, decision = rule
 
-    if decision == "ask":
-        log(f"ASK {tool} (rule={server}/{action})")
-        _ask(tool, server, action)
-        sys.exit(0)
-
-    # decision == "block" — unchanged behavior, all 10 original entries,
-    # never converted to ask (hub audit A3, 2026-09-16 — see RED_TIER above).
+    # decision is always "block" now (the operator, 2026-09-23 — see RED_TIER above).
+    # This file has no "ask" decision left; the self-test below asserts that.
     if os.environ.get("CLAUDE_MCP_GUARD_ALLOW") == "1":
         log(f"BYPASSED {tool} (rule={server}/{action}) via CLAUDE_MCP_GUARD_ALLOW=1")
         sys.exit(0)
@@ -188,12 +197,10 @@ def self_test():
         "mcp__plugin_cloudflare_cloudflare-bindings__d1_database_delete",
         "mcp__claude_ai_Calendly__meetings-cancel_event",
         "mcp__claude_ai_Supermetrics_Marketing_Analytics__campaign_create",
-    ]
-    # New for item 4 (2026-09-16 guard-fixes) -- must resolve to decision "ask",
-    # not "block": the plan's own reasoning (mass-outbound/publish, not
-    # money-moving/destructive) plus hub audit A3, which reserved "block" for
-    # the original 10 only.
-    must_ask = [
+        # Formerly decision "ask" (2026-09-16 guard-fixes item 4). the operator,
+        # 2026-09-23: "they are all approved forever. period" — no hook may
+        # pop a permission prompt, so these moved from ask to block with a
+        # per-action redirect (REDIRECT dict) instead of a tap-to-approve.
         "mcp__claude_ai_Gmail__send_message",
         "mcp__claude_ai_Gmail__reply",
         "mcp__claude_ai_Gmail__forward",
@@ -226,13 +233,6 @@ def self_test():
         if got != "block":
             ok = False
         print(f"  [{status}] must-block  {t} (decision={got})")
-    for t in must_ask:
-        rule = matched_rule(t)
-        got = rule[2] if rule else None
-        status = "PASS" if got == "ask" else "FAIL"
-        if got != "ask":
-            ok = False
-        print(f"  [{status}] must-ask    {t} (decision={got})")
     for t in must_allow:
         blocked = t.lower().startswith("mcp__") and matched_rule(t) is not None
         status = "PASS" if not blocked else "FAIL"
@@ -242,14 +242,15 @@ def self_test():
 
     # bonus fix: case-sensitivity -- an all-caps tool name used to sail past
     # the mcp__ gate before it ever reached the (correctly case-insensitive)
-    # matcher. Must now resolve exactly like its lowercase form.
+    # matcher. Must now resolve exactly like its lowercase form -- block,
+    # since decision "ask" no longer exists anywhere in this file.
     t = "MCP__CLAUDE_AI_GMAIL__SEND_MESSAGE"
     rule = matched_rule(t)
-    got_ask = t.lower().startswith("mcp__") and rule is not None and rule[2] == "ask"
-    status = "PASS" if got_ask else "FAIL"
-    if not got_ask:
+    got_block = t.lower().startswith("mcp__") and rule is not None and rule[2] == "block"
+    status = "PASS" if got_block else "FAIL"
+    if not got_block:
         ok = False
-    print(f"  [{status}] must-ask (case-insensitive gate)  {t}")
+    print(f"  [{status}] must-block (case-insensitive gate)  {t}")
 
     # Supabase destructive-SQL classifier -- independent of RED_TIER, keyed on
     # query/migration content, not the tool name.
@@ -259,15 +260,77 @@ def self_test():
         ("delete from sessions where id=1", True),
         ("INSERT INTO logs (x) VALUES (1)", False),
     ]
-    for sql, want_ask in sql_cases:
+    for sql, want_hit in sql_cases:
         got = bool(DESTRUCTIVE_SQL.search(sql))
-        status = "PASS" if got == want_ask else "FAIL"
-        if got != want_ask:
+        status = "PASS" if got == want_hit else "FAIL"
+        if got != want_hit:
             ok = False
-        print(f"  [{status}] supabase-sql-classifier  {sql!r} (ask={got}, want={want_ask})")
+        print(f"  [{status}] supabase-sql-classifier  {sql!r} (hit={got}, want={want_hit})")
+
+    if not _assert_no_ask_path():
+        ok = False
 
     print("RESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
     sys.exit(0 if ok else 1)
+
+
+def _assert_no_ask_path():
+    """No code path in this file may ever emit permissionDecision: ask again
+    (the operator, 2026-09-23 — see RED_TIER comment). Two independent checks:
+    static (the JSON shape does not appear anywhere in this file's own
+    source, and every RED_TIER decision is literally "block") and runtime
+    (actually invoking this script as the harness would, for every formerly-
+    ask tool plus the destructive-SQL path, and asserting stdout never
+    carries a permissionDecision — only a block on stderr with exit 2)."""
+    import subprocess
+
+    ok = True
+
+    # Precise on purpose: "ask" appears bare in this file's own comments
+    # (explaining the 2026-09-16 history and the 2026-09-23 fix), so the
+    # static check targets the exact JSON emission shape _ask() used to
+    # print, not the English word. Built from fragments so this check's own
+    # source line is never a false-positive match for itself.
+    danger_key = "permission" + "Decision"
+    danger_val = "a" + "sk"
+    danger = f'{danger_key}": "{danger_val}"'
+    src = open(__file__, encoding="utf-8").read()
+    static_hit = danger in src
+    status = "PASS" if not static_hit else "FAIL"
+    if static_hit:
+        ok = False
+    print(f"  [{status}] static: no permissionDecision:ask JSON literal in {os.path.basename(__file__)}")
+
+    for server, action, decision in RED_TIER:
+        good = decision == "block"
+        status = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(f"  [{status}] static: RED_TIER {server}/{action} decision={decision!r}")
+
+    runtime_cases = [
+        ("mcp__claude_ai_Gmail__send_message", {}),
+        ("mcp__claude_ai_Google_Drive__share_file", {}),
+        ("mcp__<community-project>__post_find", {}),
+        ("mcp__claude_ai_Notion__notion-delete-page", {}),
+        ("mcp__claude_ai_Supabase__execute_sql", {"query": "DROP TABLE users;"}),
+    ]
+    for tool, tool_input in runtime_cases:
+        payload = json.dumps({"tool_name": tool, "tool_input": tool_input})
+        proc = subprocess.run(
+            [sys.executable, __file__], input=payload,
+            capture_output=True, text=True, timeout=10,
+        )
+        emits_ask = '"permissionDecision"' in proc.stdout or proc.stdout.strip() != ""
+        good = proc.returncode == 2 and not emits_ask and "Blocked" in proc.stderr
+        status = "PASS" if good else "FAIL"
+        if not good:
+            ok = False
+        print(
+            f"  [{status}] runtime: {tool} -> exit={proc.returncode} "
+            f"stdout_empty={not proc.stdout.strip()} stderr_blocked={'Blocked' in proc.stderr}"
+        )
+    return ok
 
 
 if __name__ == "__main__":
