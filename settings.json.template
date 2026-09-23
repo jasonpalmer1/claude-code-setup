@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/inbox-capture.sh" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/memory-activate.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/session-autoname.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/cost-meter.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/transcript-monitor.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/ledger-banner-hook.py" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/instructions-bloat-check.py", "timeout": 10 } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/memory-activate.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/security-tripwire.py" } ] },
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/memory-health-nag.py" } ] },
+      { "matcher": "compact", "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/session-start-compact-pickup.py" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/session-end-log.sh", "timeout": 10 } ] },
+      { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/pattern-capture-check.sh" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Agent|Task|Workflow", "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/model-guard.py" } ] },
+      { "matcher": "Bash|Write|Edit|NotebookEdit", "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/safety-guard.py" } ] },
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/mcp-guard.py" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Write|Edit", "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/index-reminder.sh" }, { "type": "command", "command": "bash $HOME/.claude/hooks/memory-graph-refresh.sh" } ] },
+      { "matcher": "Read|Bash", "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/context-firewall.py", "timeout": 10 } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.claude/hooks/pre-compact-archive.sh" }, { "type": "command", "command": "python3 $HOME/.claude/hooks/pre-compact-stub.py" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "python3 $HOME/.claude/hooks/report-gate.py" } ] }
+    ]
+  },
+
+  "permissions": {
+    "allow": [
+      "Agent",
+      "SendMessage"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(gh pr merge:*)"
+    ]
+  }
+}

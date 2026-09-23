@@ -1,0 +1,68 @@
+#!/bin/zsh
+# disk-guard — read-only disk-space verdict for build dispatch gating.
+# L-0789 (2026-09-22, ~/.claude/hub/strategy/infra-disk-proactive-2026-09-22.md,
+# scope item 1 + hub-audit amendment 1). Built because the internal disk hit
+# 100% used on 2026-09-15 and 93%/15Gi again the day this ticket was opened,
+# both times with no automatic signal before the emergency was already live.
+#
+# WHAT THIS DOES, NOTHING MORE: reads free space on /System/Volumes/Data and
+# counts live build-tool processes machine-wide, prints one plain-English
+# line, logs it, and exits a verdict code. It deletes nothing, kills nothing,
+# and touches no file outside its own log. Safe to run any time, by anyone,
+# any number of times.
+#
+# Thresholds (plan section 4, scope item 3): WARN < 30Gi free, CRIT < 15Gi
+# free. These match the orphan-reaper alert thresholds this same ticket wires
+# up, so the two surfaces (guard + alert) never disagree about what "CRIT"
+# means.
+#
+# Exit codes: 0 = OK (dispatch freely), 1 = WARN (serialize — the caller
+# should hold new builds to one at a time), 2 = CRIT (hard block — no new
+# build dispatches). The build-process count is reported as data for the
+# caller to use; this script does not itself change its exit code based on
+# concurrency, only on free space.
+#
+# BUILD_COUNT is computed with a shell `case`, not a `grep` on the ps output
+# -- a grep whose own pattern text contains "npm|next|..." would match its
+# OWN process line in the same ps snapshot and over-count by one. This is the
+# same pitfall build-cache-sweep.sh's worktree_busy() already avoids the same
+# way; reused here on purpose.
+#
+# DISK_GUARD_VOLUME lets a test point this at a different df target; unset
+# (the default) always reads the real internal volume.
+set -u
+
+VOLUME=${DISK_GUARD_VOLUME:-/System/Volumes/Data}
+LOG=${DISK_GUARD_LOG:-$HOME/.claude/hub/disk-guard.log}
+mkdir -p "$(dirname "$LOG")"
+
+FREE_GI=$(df -g "$VOLUME" 2>/dev/null | awk 'NR==2{print $4}')
+case "$FREE_GI" in
+  <->) ;;  # one or more digits, good
+  *)
+    print -r -- "disk-guard: could not read free space on $VOLUME — treating as CRIT (fail safe, never fail open)"
+    print -r -- "$(date +%FT%T) disk-guard: df failed on $VOLUME — CRIT (fail-safe)" >> "$LOG"
+    exit 2
+    ;;
+esac
+
+BUILD_COUNT=0
+while read -r pid cmd; do
+  [[ -z "$pid" ]] && continue
+  case "$cmd" in
+    *npm\ *|*npx\ *|*next\ *|*yarn\ *|*pnpm\ *|*vite\ *|*webpack\ *|*turbo\ *) BUILD_COUNT=$((BUILD_COUNT + 1)) ;;
+  esac
+done < <(ps -axo pid=,command=)
+
+if (( FREE_GI < 15 )); then
+  VERDICT="CRIT"; CODE=2; NOTE="builds blocked"
+elif (( FREE_GI < 30 )); then
+  VERDICT="WARN"; CODE=1; NOTE="serialize — only 1 concurrent build"
+else
+  VERDICT="OK"; CODE=0; NOTE="builds allowed"
+fi
+
+LINE="disk-guard: ${FREE_GI}Gi free — ${VERDICT} (${NOTE}) — live build processes: ${BUILD_COUNT}"
+print -r -- "$LINE"
+print -r -- "$(date +%FT%T) $LINE" >> "$LOG"
+exit $CODE
