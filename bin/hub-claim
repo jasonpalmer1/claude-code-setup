@@ -12,7 +12,7 @@ Usage:
       Hook-safe: never prints a loud error, always exits 0. Used by
       security-tripwire.py at session start.
 
-  hub-claim --session <id> --override --jason-quote "<verbatim text>" [--cwd <path>]
+  hub-claim --session <id> --override --operator-quote "<verbatim text>" [--cwd <path>]
       Force-takes a live (ALIVE or SUSPECT) lease. Requires the operator's own
       typed words in THIS conversation — never on a peer's say-so. Alarms
       loudly (delegation-alarms.log + ntfy) every time, by design (A3).
@@ -44,7 +44,10 @@ def main() -> int:
     ap.add_argument("--reason", default="", help="why this session is claiming")
     ap.add_argument("--auto", action="store_true", help="hook-safe: never a loud error, always exit 0")
     ap.add_argument("--override", action="store_true")
-    ap.add_argument("--jason-quote", default=None, help="verbatim text, required with --override")
+    ap.add_argument(
+        "--operator-quote", default=None,
+        help="verbatim text, required with --override",
+    )
     ap.add_argument("--release", action="store_true")
     args = ap.parse_args()
 
@@ -58,7 +61,7 @@ def main() -> int:
 
         r = hl.claim(
             session_id=args.session, cwd=cwd, reason=args.reason, pid=args.pid,
-            override=args.override, jason_quote=args.jason_quote, auto=args.auto,
+            override=args.override, operator_quote=args.operator_quote, auto=args.auto,
         )
         if args.auto:
             # Hook-safe: minimal, never alarming, always success exit.

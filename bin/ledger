@@ -9,13 +9,20 @@ F-ledger-design.md for the schema this implements).
 
 Folded record fields (kept EXACT so other tools/HQ can build against them):
   id, title, status, asked_on, asked_by, owner, trigger, proof, last_surfaced,
-  jason_ack, created_at, updated_at   (+ project, an extra convenience field)
+  operator_ack, created_at, updated_at   (+ project, an extra convenience field)
 
-status values: open | active | needs-jason | done | dropped
+status values: open | active | needs-operator | done | dropped
+
+Tolerant reading (rename, 2026-09-23): the OLD field/status names --
+`operator_ack`, `needs-operator`, `asked_by: operator` -- are still read correctly
+from any existing ledger.jsonl line; ledger_lib.fold()/normalize_status()
+accept both the old and new forms so upgrading this tool never breaks a
+ledger written before the rename. Only NEW events written from here on use
+the new names.
 
 Commands:
-  ledger add "<title>" [--asked-by jason|hub] [--project X] [--owner Y]
-  ledger status <id> open|active|needs-jason|done|dropped
+  ledger add "<title>" [--asked-by operator|hub] [--project X] [--owner Y]
+  ledger status <id> open|active|needs-operator|done|dropped
   ledger proof <id> <type> <ref> [--note "..."]
   ledger ack <id>
   ledger claim <id> <owner>       # you (or the named owner) now hold it
@@ -170,7 +177,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
             "ts": now_iso(),
             "id": args.id,
             "event": "ack",
-            "jason_ack": True,
+            "operator_ack": True,
         })
     print(f"{args.id}: acked")
     return 0
@@ -207,7 +214,7 @@ def cmd_note(args: argparse.Namespace) -> int:
 
     Added 2026-09-15 for L-0314 (Mission HQ ticket tracker): the dispatcher
     needs to record "the operator tapped: <option>" against a ticket whose status it
-    is also flipping (active for a fast-pathed safe answer, needs-jason for a
+    is also flipping (active for a fast-pathed safe answer, needs-operator for a
     gated one) so the next reader sees WHAT was tapped, not just that
     something changed. ledger_lib.fold() has always understood a "note" event
     (it is in validate_event's canonical set and cmd_proof already accepts
@@ -272,7 +279,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 0
     for r in items:
         proof_flag = f" proof:{len(r['proof'])}" if r["proof"] else ""
-        ack_flag = " unacked" if r["asked_by"] == "jason" and not r["jason_ack"] and r["status"] == "done" else ""
+        ack_flag = " unacked" if r["asked_by"] == "operator" and not r["operator_ack"] and r["status"] == "done" else ""
         print(f"{r['id']}  [{r['status']}]{proof_flag}{ack_flag}  {r['title']}  "
               f"(owner: {r['owner']}, asked_by: {r['asked_by']})")
     return 0
@@ -319,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proof.add_argument("--note", default=None)
     p_proof.set_defaults(func=cmd_proof)
 
-    p_ack = sub.add_parser("ack", help="the operator acknowledges an item")
+    p_ack = sub.add_parser("ack", help="The operator acknowledges an item")
     p_ack.add_argument("id")
     p_ack.set_defaults(func=cmd_ack)
 

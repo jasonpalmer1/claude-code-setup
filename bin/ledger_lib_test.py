@@ -32,7 +32,7 @@ def make_rec(**overrides) -> dict:
         "id": "L-TEST", "title": "a test ticket", "status": "open",
         "asked_on": None, "asked_by": "hub", "owner": "unowned",
         "trigger": "", "project": None, "proof": [], "last_surfaced": None,
-        "jason_ack": False, "created_at": None, "updated_at": None,
+        "operator_ack": False, "created_at": None, "updated_at": None,
         "notes": [], "decisions": [], "schema_issues": [],
     }
     rec.update(overrides)
@@ -45,24 +45,24 @@ class NeedsYouIsNotARubberStampTests(unittest.TestCase):
     ledger_lib, not just in bin/status (which bin/status's own test suite,
     status_test.py's NeedsYouIsNotARubberStampTests, already pins)."""
 
-    def test_needs_jason_status_is_needs_you(self):
-        rec = make_rec(status="needs-jason")
+    def test_needs_operator_status_is_needs_you(self):
+        rec = make_rec(status="needs-operator")
         self.assertTrue(ledger_lib.needs_you(rec))
 
-    def test_done_jason_asked_no_ack_is_NOT_needs_you(self):
+    def test_done_operator_asked_no_ack_is_NOT_needs_you(self):
         """The exact shape that produced the false CONFIRM lines on
         L-0354/L-0360 (see L-0377's own ledger note) and required a manual
         24-ticket ack-event workaround (commit 84f6c31) to clear -- proof
         the bug was live, not merely theoretical, right up to this fix."""
-        rec = make_rec(status="done", asked_by="jason", jason_ack=False)
+        rec = make_rec(status="done", asked_by="operator", operator_ack=False)
         self.assertFalse(ledger_lib.needs_you(rec))
 
-    def test_done_jason_asked_with_ack_is_also_not_needs_you(self):
-        rec = make_rec(status="done", asked_by="jason", jason_ack=True)
+    def test_done_operator_asked_with_ack_is_also_not_needs_you(self):
+        rec = make_rec(status="done", asked_by="operator", operator_ack=True)
         self.assertFalse(ledger_lib.needs_you(rec))
 
     def test_done_hub_asked_no_ack_is_not_needs_you(self):
-        rec = make_rec(status="done", asked_by="hub", jason_ack=False)
+        rec = make_rec(status="done", asked_by="hub", operator_ack=False)
         self.assertFalse(ledger_lib.needs_you(rec))
 
     def test_open_and_active_are_not_needs_you(self):
@@ -74,24 +74,24 @@ class NeedsYouIsNotARubberStampTests(unittest.TestCase):
         """Not a test of production code -- a self-check that the tests
         above actually exercise the live branch and aren't vacuously green.
         Reimplements the OLD (pre-fix) rule inline and shows the exact
-        synthetic ticket from test_done_jason_asked_no_ack_is_NOT_needs_you
+        synthetic ticket from test_done_operator_asked_no_ack_is_NOT_needs_you
         WOULD have tripped it, so that test is provably not a dead branch."""
         def old_needs_you(rec):
-            if rec["status"] == "needs-jason":
+            if rec["status"] == "needs-operator":
                 return True
-            if rec["status"] == "done" and rec["asked_by"] == "jason" and not rec["jason_ack"]:
+            if rec["status"] == "done" and rec["asked_by"] == "operator" and not rec["operator_ack"]:
                 return True
             return False
 
-        rec = make_rec(status="done", asked_by="jason", jason_ack=False)
+        rec = make_rec(status="done", asked_by="operator", operator_ack=False)
         self.assertFalse(ledger_lib.needs_you(rec), "fixed predicate")
         self.assertTrue(old_needs_you(rec), "old predicate must still trip on the same input")
 
     def test_banner_lines_needs_you_count_matches_needs_you(self):
         records = {
-            "L-1": make_rec(id="L-1", status="needs-jason"),
-            "L-2": make_rec(id="L-2", status="done", asked_by="jason", jason_ack=False),
-            "L-3": make_rec(id="L-3", status="done", asked_by="jason", jason_ack=False),
+            "L-1": make_rec(id="L-1", status="needs-operator"),
+            "L-2": make_rec(id="L-2", status="done", asked_by="operator", operator_ack=False),
+            "L-3": make_rec(id="L-3", status="done", asked_by="operator", operator_ack=False),
             "L-4": make_rec(id="L-4", status="active"),
         }
         lines = ledger_lib.banner_lines(records)
@@ -102,21 +102,75 @@ class SurfaceLinesNoConfirmBlockTests(unittest.TestCase):
     """L-0377(a) continued: surface_lines() must never print a CONFIRM /
     awaiting-ack line again, for any status."""
 
-    def test_no_confirm_line_for_done_unacked_jason_ask(self):
-        records = {"L-1": make_rec(id="L-1", status="done", asked_by="jason",
-                                    jason_ack=False, title="ship the thing")}
+    def test_no_confirm_line_for_done_unacked_operator_ask(self):
+        records = {"L-1": make_rec(id="L-1", status="done", asked_by="operator",
+                                    operator_ack=False, title="ship the thing")}
         lines = ledger_lib.surface_lines(records)
         self.assertEqual(lines, [])
         self.assertFalse(any("CONFIRM" in line for line in lines))
 
-    def test_needs_jason_still_surfaces_first(self):
+    def test_needs_operator_still_surfaces_first(self):
         now = ledger_lib.now_iso()
         records = {
-            "L-1": make_rec(id="L-1", status="needs-jason", title="pick a color", updated_at=now),
+            "L-1": make_rec(id="L-1", status="needs-operator", title="pick a color", updated_at=now),
         }
         lines = ledger_lib.surface_lines(records)
         self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith("NEEDS-JASON L-1"))
+        self.assertTrue(lines[0].startswith("NEEDS-OPERATOR L-1"))
+
+
+class TolerantReadingOfOldFieldNames(unittest.TestCase):
+    """Fix round 2 (2026-09-23): the rename above (operator_ack -> operator_ack,
+    needs-operator -> needs-operator, asked_by "operator" -> "operator") must not
+    break folding a ledger.jsonl written before the rename. These tests build
+    real event dicts using the OLD literal names -- exactly what already
+    sits in such a file -- and prove fold() still produces the CURRENT
+    (renamed) shape, not the old one."""
+
+    def test_fold_reads_old_needs_operator_status_literal(self):
+        events = [
+            {"ts": "2026-01-01T00:00:00Z", "id": "L-1", "event": "created",
+             "title": "x", "asked_by": "hub"},
+            {"ts": "2026-01-01T00:01:00Z", "id": "L-1", "event": "status", "status": "needs-operator"},
+        ]
+        rec = ledger_lib.fold(events)["L-1"]
+        self.assertEqual(rec["status"], "needs-operator")
+        self.assertTrue(ledger_lib.needs_you(rec))
+
+    def test_fold_reads_old_needs_operator_event_name(self):
+        events = [
+            {"ts": "2026-01-01T00:00:00Z", "id": "L-2", "event": "created",
+             "title": "x", "asked_by": "hub"},
+            {"ts": "2026-01-01T00:01:00Z", "id": "L-2", "event": "needs_operator"},
+        ]
+        rec = ledger_lib.fold(events)["L-2"]
+        self.assertEqual(rec["status"], "needs-operator")
+
+    def test_fold_reads_old_asked_by_operator(self):
+        events = [
+            {"ts": "2026-01-01T00:00:00Z", "id": "L-3", "event": "created",
+             "title": "x", "asked_by": "operator"},
+        ]
+        rec = ledger_lib.fold(events)["L-3"]
+        self.assertEqual(rec["asked_by"], "operator")
+
+    def test_fold_reads_old_operator_ack_field(self):
+        events = [
+            {"ts": "2026-01-01T00:00:00Z", "id": "L-4", "event": "created",
+             "title": "x", "asked_by": "hub"},
+            {"ts": "2026-01-01T00:01:00Z", "id": "L-4", "event": "ack", "operator_ack": True},
+        ]
+        rec = ledger_lib.fold(events)["L-4"]
+        self.assertTrue(rec["operator_ack"])
+
+    def test_normalize_status_maps_old_literal_directly(self):
+        self.assertEqual(ledger_lib.normalize_status("needs-operator"), "needs-operator")
+        self.assertEqual(ledger_lib.normalize_status("needs_operator"), "needs-operator")
+
+    def test_normalize_asked_by_maps_old_literal_directly(self):
+        self.assertEqual(ledger_lib.normalize_asked_by("operator"), "operator")
+        self.assertEqual(ledger_lib.normalize_asked_by("operator"), "operator")
+        self.assertEqual(ledger_lib.normalize_asked_by("hub"), "hub")
 
 
 class ImportedBoardNoteTests(unittest.TestCase):
@@ -127,7 +181,7 @@ class ImportedBoardNoteTests(unittest.TestCase):
         for title in (
             "2026-09-06 13:00 · hub · **AGENT FRAMEWORK REDESIGN (the operator...",
             "2026-09-03 · extract · the operator chose public BYO-key (detail...",
-            "2026-09-04 07:45 · extract · **ECONOMY DIAL DECIDED BY JASON...",
+            "2026-09-04 07:45 · extract · **ECONOMY DIAL DECIDED BY operator...",
         ):
             self.assertTrue(ledger_lib.is_imported_board_note(make_rec(title=title)), title)
 
@@ -164,7 +218,7 @@ class ImportedBoardNoteTests(unittest.TestCase):
         for title in (
             "QUEUED: WS retention + community research, nothing built",
             "DEFINE how a ticket gets CLOSED - a real done-process",
-            "NEEDS JASON: Phase 2 PRs #38 (funnel analytics) + #36",
+            "NEEDS operator: Phase 2 PRs #38 (funnel analytics) + #36",
             "ACTIVE work on the 2026-09-06 regression, no separator here",
         ):
             self.assertFalse(ledger_lib.is_imported_board_note(make_rec(title=title)), title)
