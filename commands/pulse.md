@@ -11,7 +11,7 @@ Steps:
 
 1. **Read [[reference_analytics]] first** for the current script location (`cf_analytics.mjs`), env vars/tokens, and per-site setup state. If tokens aren't activated for a site, report it as `not wired` — don't guess numbers.
 
-2. **Run the analytics pull** for each wired site (<product-b>, <product-a>, jasonwpalmer-com, + any since added) over the last 7 days. Use the script's human-vs-bot estimate (crawler-referrer + pages/visit heuristic) — headline number is **human visits**, bots listed separately.
+2. **Run the analytics pull** for each wired site (<product-b>, <product-a>, <your-domain>, + any since added) over the last 7 days. Use the script's human-vs-bot estimate (crawler-referrer + pages/visit heuristic) — headline number is **human visits**, bots listed separately.
 
 3. **Compare to the previous reading.** Pulse history lives at `~/projects/pulse-log.md` (create on first run: date, site, human visits, bot visits, note). Report the delta per site. Append today's reading after reporting.
 
