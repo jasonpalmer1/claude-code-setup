@@ -1,40 +1,35 @@
 #!/usr/bin/env python3
 """Live cost meter: warn DURING a session, not after it ends.
 
-The SessionEnd ledger hook (token-ledger.py) only prices a session once it's
-over — for a session that runs for hours, that means nobody sees the running
-total until it's too late to change course. This fires on every prompt and
-surfaces the running total once it crosses a threshold, so a long, expensive
-session gets flagged while it's still happening.
+Why this exists (2026-08-02): the SessionEnd ledger only prices a session once
+it's over, so a session can reach $2,484 with nobody noticing. Five sessions
+crossed $1,300 each and 10 sessions accounted for 55% of $23,986 all-time spend.
+This fires on every prompt and surfaces the running total once it crosses a
+threshold.
 
-PERFORMANCE — this is a per-prompt blocking hook, so it must stay fast even
-when the transcript is large. It never re-reads the whole file: per-file byte
-offsets and running token totals are cached in STATE_DIR and each run parses
-ONLY the bytes appended since last time. JSONL is append-only, so offset
-resume is sound. Cost is recomputed from the cached totals, not re-summed
+PERFORMANCE — this is a per-prompt blocking hook, so it must stay in the tens of
+milliseconds even when the transcript is 100 MB. It never re-reads the whole
+file: per-file byte offsets and running token totals are cached in STATE_DIR and
+each run parses ONLY the bytes appended since last time. JSONL is append-only, so
+offset resume is sound. Cost is recomputed from the cached totals, not re-summed
 from disk.
 
-Pricing and tier detection are imported from token-ledger.py so there is
-exactly one price table in your setup. If that import fails the meter goes
-silent rather than guessing at prices.
-
-THRESHOLDS below are a starting point — calibrate them from your own ledger
-once you have one (see "mine your own ledger" in the README): pick the dollar
-level where a session has clearly become "a real session," the level that's
-in your own top quartile, and the level that's genuinely rare.
+Pricing and tier detection are imported from token-ledger.py so there is exactly
+one price table on this machine. If that import fails the meter goes silent
+rather than guessing at prices.
 
 Fails silent and always exits 0 — a cost warning must never block a prompt.
 """
-import json, sys, os, datetime, importlib.util
+import json, sys, os, glob, datetime, importlib.util
 
 HOOKS = os.path.expanduser("~/.claude/hooks")
 STATE_DIR = os.path.expanduser("~/.claude/hub/cost-meter")
 LOG = os.path.expanduser("~/.claude/hub/cost-meter.log")
 ERROR_LOG = os.path.expanduser("~/.claude/hub/hook-errors.log")
 
-# Escalating so it informs once and then gets out of the way. Past this list
-# it repeats every 500 (in whatever currency your price table uses).
-# Calibrate the actual numbers to your own ledger.
+# Escalating so it informs once and then gets out of the way. Past this list it
+# repeats every $500. Tuned to the observed damage: $50 is "this is a real
+# session now", $150 is "this is in the top quartile", $500+ is "the top 10".
 THRESHOLDS = [50, 150, 300, 500, 750, 1000, 1500, 2000]
 
 
@@ -131,9 +126,9 @@ def main():
     acc = {k: list(v) for k, v in state.get("acc", {}).items()}
     offsets = dict(state.get("offsets", {}))
 
-    # Main transcript + every subagent transcript, if your harness's ledger
-    # helper exposes them (agent_transcripts) — subagent spend is otherwise
-    # invisible to this meter.
+    # Main transcript + every subagent transcript (workflow agents nest deeper
+    # and a session that cd's gets a second project dir — agent_transcripts
+    # already handles both; that spend was 55% invisible before 2026-07-24).
     paths = [os.path.realpath(tp)]
     try:
         paths += L.agent_transcripts(tp, sid)
@@ -191,33 +186,33 @@ def main():
         return
 
     mix = "  ".join(f"{t} ${per_tier[t]:.0f}" for t in sorted(per_tier, key=lambda k: -per_tier[k]))
-    note = (
-        "end this session and start fresh — cost scales with how long a single "
-        "session runs, because every turn re-bills the whole conversation"
-    )
-    msg = f"COST METER — this session has spent ${cost:.0f} ({mix}). Consider: {note}."
+    # the operator 2026-09-23 standing rule: no chat ever asks him to /clear or stops for
+    # size; it keeps its log current and auto-compact trims context (L-0910).
+    msg = (f"COST METER — this session has used about ${cost:.0f} token-equivalent (list-price estimate; subscription, not billed) ({mix}). Nothing for you "
+           f"to do: it keeps its log current and auto-compact trims its context.")
 
     try:
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         with open(LOG, "a") as f:
             f.write(
                 f"{datetime.datetime.now().isoformat(timespec='seconds')} "
-                f"{sid[:8]} ${cost:.2f} crossed ${level}\n"
+                f"{sid[:8]} ${cost:.2f} token-equiv crossed ${level}\n"
             )
     except Exception:
         pass
 
-    # systemMessage surfaces to the user directly; additionalContext tells the
-    # assistant so it can act on it unprompted rather than the user having to
-    # ask what's happening.
+    # systemMessage surfaces to the operator; additionalContext tells the assistant so
+    # it can act on it (his rule: he shouldn't have to ask what's happening).
     print(json.dumps({
         "systemMessage": f"💸 {msg}",
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                f"[cost-meter] Session spend is now ${cost:.0f} ({mix}). "
-                f"Tell the user plainly, in one line, and suggest wrapping up "
-                f"this session with a log/checkpoint then clearing if the work allows."
+                f"[cost-meter] Session usage is now about ${cost:.0f} token-equivalent (list-price estimate, subscription, not real dollars) ({mix}). "
+                f"Tell the operator plainly, in one line. Never suggest /clear or "
+                f"stopping (the operator's rule, 2026-09-23): make sure this session's "
+                f"log is current (Resume state + Pickup prompts, committed), "
+                f"then keep working."
             ),
         },
     }))

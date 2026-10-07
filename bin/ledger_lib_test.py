@@ -155,13 +155,26 @@ class TolerantReadingOfOldFieldNames(unittest.TestCase):
         self.assertEqual(rec["asked_by"], "operator")
 
     def test_fold_reads_old_operator_ack_field(self):
+        """Fix round 3 (2026-09-23, bug-gate r2 mutation-test finding): the
+        original fixture used operator_ack: True, which is IDENTICAL to
+        fold()'s own hardcoded default (e.get("operator_ack",
+        e.get("operator_ack", True))). A mutant that deletes the operator_ack
+        fallback entirely (falling straight back to True) still passed this
+        assertion -- the test could not tell "the fallback read the old
+        field" apart from "the fallback vanished and the default happened
+        to match". Using False here — the non-default value — makes the
+        assertion load-bearing: only code that actually reads operator_ack
+        produces False; a mutant with the fallback removed produces True
+        and this test catches it. Confirmed via a real mutation run against
+        a temp copy of ledger_lib.py (never the tracked file) before this
+        fix: reverted, this exact assertion failed against the mutant."""
         events = [
             {"ts": "2026-01-01T00:00:00Z", "id": "L-4", "event": "created",
              "title": "x", "asked_by": "hub"},
-            {"ts": "2026-01-01T00:01:00Z", "id": "L-4", "event": "ack", "operator_ack": True},
+            {"ts": "2026-01-01T00:01:00Z", "id": "L-4", "event": "ack", "operator_ack": False},
         ]
         rec = ledger_lib.fold(events)["L-4"]
-        self.assertTrue(rec["operator_ack"])
+        self.assertFalse(rec["operator_ack"])
 
     def test_normalize_status_maps_old_literal_directly(self):
         self.assertEqual(ledger_lib.normalize_status("needs-operator"), "needs-operator")

@@ -4,7 +4,15 @@
 #
 #   spawn <name> -m <model> [-d <dir>] [-p "<opening prompt>"] [--split] [--shell]
 #              [--parent <session-id>] [--force-depth] [--steal] [--force]
-#              [--inherit-model] [--in-place]
+#              [--inherit-model] [--in-place] [--top-tier "<reason>"] [--no-auto]
+#
+# Permission mode: chats launch in bypassPermissions (FLEET_AUTO=1) BY DEFAULT, matching the hub.
+# A default-mode chat is unreachable: Claude Code holds hub messages to a different permission class
+# (feedback_lane_chats_must_match_hub_mode, 2026-10-04). --no-auto opts out and warns. After launch,
+# send one hub message; if it is held, the chat is in the wrong mode.
+#
+# L-1559: lanes run Sonnet. -m opus/fable (or --inherit-model when settings.json is opus) is
+# refused unless the name is Hub or --top-tier "<reason>" is given (logged to hub/model-escalations.log).
 #
 # -m/--model is REQUIRED (2026-08-13): an unspecified model silently inherits
 # settings.json's main-loop tier — the most expensive one — instead of the
@@ -47,15 +55,15 @@
 set -euo pipefail
 
 FLEET="$HOME/.claude/fleet"
-JOBS="$FLEET/jobs"
+JOBS="${FLEET_JOBS_DIR:-$FLEET/jobs}"   # FLEET_JOBS_DIR: tests redirect job files
 mkdir -p "$JOBS"
 # shellcheck disable=SC1091
-. "$FLEET/lib.sh"
+. "${FLEET_LIB_DIR:-$FLEET}/lib.sh"   # FLEET_LIB_DIR: tests point at a worktree copy
 
-name=""; dir="$PWD"; model=""; prompt=""; split=0; shell_only=0; auto=0; rc=0
-parent=""; force_depth=0; steal=0; force=0; inherit_model=0; in_place=0
+name=""; dir="$PWD"; model=""; prompt=""; split=0; shell_only=0; auto=1; rc=1  # rc ON by default (the operator 2026-09-23: "any new chat has remote control on")
+parent=""; force_depth=0; steal=0; force=0; inherit_model=0; in_place=0; top_tier=""
 
-usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,14 +71,17 @@ while [ $# -gt 0 ]; do
     -m|--model)       model="$2"; shift 2 ;;
     -p|--prompt)      prompt="$2"; shift 2 ;;
     --split)          split=1; shift ;;
-    --auto)           auto=1; shift ;;   # launch with --permission-mode acceptEdits
-    --rc)             rc=1; shift ;;     # launch with --remote-control <name> (phone-drivable)
+    --auto)           auto=1; shift ;;   # launch with --permission-mode bypassPermissions (already the default)
+    --no-auto)        auto=0; shift ;;   # default-mode chat; hub cannot message it (warns)
+    --rc)             rc=1; shift ;;     # launch with --remote-control <name> (phone-drivable; now the default)
+    --no-rc)          rc=0; shift ;;     # opt out of remote control
     --shell)          shell_only=1; shift ;;
     --parent)         parent="$2"; shift 2 ;;   # spawning session's id (for ledger rollup)
     --force-depth)    force_depth=1; shift ;;   # allow a peer-of-a-peer (depth >= 2)
     --steal)          steal=1; shift ;;         # take over a fresh lock on the target dir
     --force)          force=1; shift ;;         # override the concurrent-ceiling refusal
     --inherit-model)  inherit_model=1; shift ;; # deliberate opt-out of the -m requirement
+    --top-tier)       top_tier="$2"; shift 2 ;;   # L-1559: reason to run a lane on opus/fable (logged)
     --in-place)       in_place=1; shift ;;      # opt out of the per-lane worktree (2026-09-03)
     -h|--help)        usage 0 ;;
     -*)               echo "spawn: unknown flag $1" >&2; usage 1 ;;
@@ -80,6 +91,13 @@ done
 
 [ -n "$name" ] || { echo "spawn: need a name" >&2; usage 1; }
 case "$name" in *[!A-Za-z0-9_-]*) echo "spawn: name must be [A-Za-z0-9_-]" >&2; exit 1 ;; esac
+
+# L-1559 item 2: lanes on Sonnet. Opus/Fable refused unless the name is Hub or --top-tier "<reason>".
+# Runs before any side effect (worktree, lock, job file). FLEET_MODEL_CHECK_ONLY=1 stops right after (tests).
+fleet_check_model "$name" "$model" "$top_tier" "$inherit_model" || exit 1
+[ "${FLEET_MODEL_CHECK_ONLY:-0}" = 1 ] && exit 0
+
+[ "$auto" = 0 ] && echo "spawn: ⚠ --no-auto — this chat runs in default permission mode; the hub CANNOT message it (cross-mode messages are held for approval). Use only for a chat nobody will message." >&2
 
 dir="${dir/#\~/$HOME}"
 [ -d "$dir" ] || { echo "spawn: no such dir: $dir" >&2; exit 1; }
@@ -118,6 +136,12 @@ fi
 
 # --- guardrails --------------------------------------------------------------
 caller_depth="${CLAUDE_FLEET_DEPTH:-0}"
+# L-1229: the hub is the one sanctioned root dispatcher and must be able to
+# spawn freely even though the hub session is itself usually fleet-launched
+# (see fleet_is_hub_caller's comment in lib.sh for why that matters here).
+if fleet_is_hub_caller; then
+  caller_depth=0
+fi
 new_depth="$(fleet_check_depth "$caller_depth" "$force_depth")" || exit 1
 
 [ -n "$parent" ] || parent="${CLAUDE_SESSION_ID:-unknown}"
@@ -143,6 +167,7 @@ while [ -e "$JOBS/$name.job" ]; do name="$base-$n"; n=$((n+1)); done
   printf 'FLEET_DEPTH=%q\n'  "$new_depth"
   printf 'FLEET_PARENT=%q\n' "$parent"
 } > "$JOBS/$name.job"
+[ "${FLEET_JOBFILE_ONLY:-0}" = 1 ] && exit 0   # tests: stop once the job file exists
 
 # Claim the dir now, before driving VS Code — this is the mutex. `run` removes
 # it (via trap) when the launched session's process exits; if the launch
@@ -152,7 +177,17 @@ fleet_write_lock "$lockfile" "$dir" "$name"
 
 launcher="$FLEET/run $name"
 
-# --- drive VS Code -----------------------------------------------------------
+# --- open the host terminal ---------------------------------------------------
+# Default host is Terminal.app via `do script` (the operator, 2026-09-23: "Just use terminal Claude RC
+# from here on out"). It opens its own window with no keystrokes, focus, or clipboard, so it no
+# longer fails when the operator is typing or VS Code isn't frontmost. FLEET_HOST=vscode keeps the old path.
+if [ "${FLEET_HOST:-terminal}" = terminal ]; then
+  osascript - "$launcher" <<'APPLESCRIPT' >/dev/null
+on run argv
+    tell application "Terminal" to do script (item 1 of argv)
+end run
+APPLESCRIPT
+else
 prev_clip="$(pbpaste 2>/dev/null || true)"
 printf '%s' "$launcher" | pbcopy
 
@@ -177,6 +212,7 @@ APPLESCRIPT
 
 sleep 0.6
 printf '%s' "$prev_clip" | pbcopy 2>/dev/null || true
+fi
 
 # verify the new tab actually claimed its job (run deletes the file on claim)
 # 90 x 0.5s = ~45s. Widened from 10s on 2026-08-10 (the operator's go): slow-booting sessions were
@@ -190,10 +226,11 @@ if [ -e "$JOBS/$name.job" ]; then
   # Do NOT delete the job file — a still-booting tab can claim it late and self-recover.
   # Release only the lock so a retry isn't blocked.
   rm -f "$lockfile"
-  echo "spawn: UNCONFIRMED — no claim from '$name' within 45s; job file left in place at $JOBS/$name.job so a slow tab can still claim it. Check VS Code before respawning." >&2
+  echo "spawn: UNCONFIRMED — no claim from '$name' within 45s; job file left in place at $JOBS/$name.job so a slow tab can still claim it. Check the new Terminal window before respawning." >&2
   exit 1
 fi
 
 echo "spawned+verified: $name  ->  $dir${model:+  [$model]}  (depth $new_depth, parent ${parent:0:8})"
+echo "  next: send one hub message; if held, the chat is in the wrong mode (kill + respawn without --no-auto)"
 [ -n "$prompt" ] && echo "  opening prompt: $prompt"
 exit 0

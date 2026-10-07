@@ -43,6 +43,19 @@ def main() -> int:
     except (json.JSONDecodeError, ValueError):
         payload = {}
 
+    # L-1559 item 10: any SessionStart (startup/resume/clear/compact) means
+    # earlier per-prompt injections may be gone from context, so forget the
+    # emit_once hashes and let the next prompt re-show the ledger banner.
+    # (This is also the compaction reset; PreCompact would add nothing.)
+    if payload.get("hook_event_name") == "SessionStart":
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+            import emit_once  # type: ignore
+
+            emit_once.reset(payload.get("session_id"))
+        except Exception:
+            pass
+
     cwd = payload.get("cwd") or os.getcwd()
     query = (payload.get("prompt") or payload.get("user_prompt") or "").strip()
 
@@ -71,7 +84,13 @@ def main() -> int:
     # UserPromptSubmit path repeats the same pointer block every single turn,
     # which is exactly the always-on context tax this system exists to remove.
     sid = payload.get("session_id") or "nosession"
-    seen_path = Path(f"/tmp/claude-memact-{sid}.json")
+    import re as _re
+    cache = Path.home() / ".claude/hub/state/hooknote-cache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    seen_path = cache / f"{_re.sub(r'[^A-Za-z0-9_.-]', '_', str(sid))[:80]}.memact.json"
     try:
         seen = set(json.loads(seen_path.read_text())) if seen_path.exists() else set()
         if payload.get("hook_event_name") == "SessionStart":

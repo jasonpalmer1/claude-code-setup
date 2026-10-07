@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""ask-operator -- THE way the hub (or any session/worker) asks the operator a question. It lands on his HQ
+Decisions page: one card at a time, full context, recommended answer first. His tap comes back
+automatically (ask-poller, launchd, every 60s) into hub/state/operator-answers.jsonl, the ledger, and a hub wake.
+
+  ask-operator add --ticket L-1234 --header "Short title" --context "Full plain-English paragraph: what is
+        going on, why it matters, what happens for each answer." \
+        --option "Yes, ship it|What happens if yes" --option "No, hold|What happens if no" \
+        [--option "..."] [--recommended 0] [--id my-id]
+      (2-4 options; --recommended is the 0-based index; the recommended one is shown first, marked.)
+  ask-operator list [--state pending|answered|unacked|all]
+  ask-operator delete ID
+Context can come from a file: --context-file PATH (or '-' for stdin). Exit 0 and prints "asked <id>" on success.
+"""
+import argparse, json, sys, os
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ask_lib, ask_redact
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add")
+    a.add_argument("--ticket", default="")
+    a.add_argument("--header", required=True)
+    g = a.add_mutually_exclusive_group(required=True)
+    g.add_argument("--context")
+    g.add_argument("--context-file")
+    a.add_argument("--option", action="append", default=[], help='"label|description" (2-4)')
+    a.add_argument("--recommended", type=int, default=0)
+    a.add_argument("--id", default="")
+    l = sub.add_parser("list"); l.add_argument("--state", default="pending")
+    d = sub.add_parser("delete"); d.add_argument("id")
+    n = ap.parse_args()
+    try:
+        if n.cmd == "add":
+            ctx = n.context if n.context is not None else (sys.stdin.read() if n.context_file == "-" else open(n.context_file).read())
+            opts = []
+            for o in n.option:
+                lab, _, desc = o.partition("|")
+                opts.append({"label": lab.strip(), "description": desc.strip()})
+            if not 2 <= len(opts) <= 4:
+                sys.exit("ask-operator: give 2-4 --option values")
+            if not 0 <= n.recommended < len(opts):
+                sys.exit("ask-operator: --recommended out of range")
+            body = {"op": "add", "ticket": n.ticket, "header": n.header, "context": ctx, "options": opts, "recommended": n.recommended}
+            if n.id:
+                body["id"] = n.id
+            st, j = ask_lib.call("POST", "/api/asks", body)
+            if st == 200 and j and j.get("ok"):
+                print("asked " + j["id"]); return 0
+            sys.exit("ask-operator: HQ refused (%s): %s" % (st, (j or {}).get("error")))
+        if n.cmd == "list":
+            st, j = ask_lib.call("GET", "/api/asks?state=" + n.state)
+            if st != 200 or not j:
+                sys.exit("ask-operator: HQ refused (%s)" % st)
+            for q in j["asks"]:
+                oth = ask_redact.redact(q["answer_other"], q["id"], lambda svc, v: None)[0] if q["answer_other"] else q["answer_other"]  # display only; poller owns the Keychain write
+                ans = (" -> " + (q["answer_label"] or "OTHER: " + str(oth))) if q["answered_at"] else ""
+                print("%s\t%s\t%s%s" % (q["id"], q["ticket"], q["header"], ans))
+            if not j["asks"]:
+                print("none")
+            return 0
+        st, j = ask_lib.call("POST", "/api/asks", {"op": "delete", "id": n.id})
+        print("deleted %s" % (j or {}).get("deleted", 0)); return 0 if st == 200 else 1
+    except OSError as e:
+        sys.exit("ask-operator: network error: %s" % e)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

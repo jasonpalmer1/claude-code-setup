@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""hub-log-append (L-1774): the one sanctioned way for a session that cannot
+Edit/Write (bg-isolation guard) to land a real log and clear the
+log-staleness-enforcer block.
+
+Usage: hub-log-append <abs log path under conversations dir> <session-id> <text>
+
+<text> uses literal \\n escapes for newlines and MUST contain both
+labels "Resume state:" and "Pickup prompts:" plus >= 120 chars of other content, and no CR/line separators. Appends a dated "## Update" section plus
+the exact footer `<!-- logged-session: <id> -->`, then runs
+`git add` + `git commit -m 'log: session update' -- <file>` on that one file.
+No other side effects. Refuses (exit 2) on any failed check.
+
+Env overrides (tests only): LOG_ENFORCER_MEMORY_CONVOS_DIR, HUB_LOG_APPEND_REPO.
+"""
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+BASENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_[\w.-]+\.md$")
+
+
+def die(msg: str) -> None:
+    sys.stderr.write(f"hub-log-append: refused: {msg}\n")
+    sys.exit(2)
+
+
+def main() -> None:
+    if len(sys.argv) != 4:
+        die("usage: hub-log-append <log path> <session-id> <text>")
+    raw_path, sid, text = sys.argv[1:4]
+    convos = Path(os.environ.get("LOG_ENFORCER_MEMORY_CONVOS_DIR")
+                  or Path.home() / ".claude/projects/<home-slug>/memory/conversations")
+    repo = os.environ.get("HUB_LOG_APPEND_REPO") or str(Path.home() / ".claude")
+    if not os.path.isabs(raw_path):
+        die("path must be absolute")
+    p = Path(os.path.normpath(raw_path))
+    if not BASENAME_RE.match(p.name):
+        die("basename must be YYYY-MM-DD_slug.md")
+    try:
+        real_dir = Path(os.path.realpath(p.parent))
+        real_base = Path(os.path.realpath(convos))
+    except Exception:
+        die("cannot resolve path")
+    if real_dir != real_base:
+        die("path is not directly inside the conversations dir")
+    if p.is_symlink():
+        die("path is a symlink")
+    if not SESSION_ID_RE.fullmatch(sid):
+        die("invalid session id")
+    body = text.replace("\\n", "\n")
+    if re.search(r"[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", text):
+        die("text must not contain CR or other line-separator characters")
+    if "Resume state:" not in body or "Pickup prompts:" not in body:
+        die('text must contain both labels "Resume state:" and "Pickup prompts:"')
+    if len(body.replace("Resume state", "").replace("Pickup prompts", "").strip()) < 120:
+        die("text too short: need at least 120 chars of real content besides the labels")
+    if re.search(r"^\s*<!--\s*logged-session:", body, re.M):
+        die("text must not contain its own footer line")
+    real = real_dir / p.name
+    existing = real.read_text() if real.exists() else ""
+    sep = "" if (not existing or existing.endswith("\n\n")) else ("\n" if existing.endswith("\n") else "\n\n")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    section = f"{sep}\n## Update {now}\n\n{body.strip()}\n\n<!-- logged-session: {sid} -->\n"
+    with open(real, "a") as f:
+        f.write(section)
+    for args in (["add", "--", str(real)],
+                 ["commit", "-m", "log: session update", "--", str(real)]):
+        r = subprocess.run(["git", "-C", repo] + args, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(r.stdout + r.stderr)
+            die(f"git {args[0]} failed (file was written)")
+    print(f"hub-log-append: logged {real} for session {sid}")
+
+
+if __name__ == "__main__":
+    main()

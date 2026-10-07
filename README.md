@@ -86,6 +86,53 @@ run enough of the above instead of skipping half of it to save money.
 days.** A fresh session with a clear scope is something I — or a second reviewer — can actually
 audit end to end; a context accumulating for a week is not.
 
+## Set up in 10 minutes
+
+Works on a fresh Mac (macOS, with `git`, `python3`, and [Claude Code](https://claude.com/claude-code) installed). Nothing is written until you say so.
+
+1. **Clone** (1 min)
+   ```sh
+   git clone https://github.com/jasonpalmer1/claude-code-setup.git
+   cd claude-code-setup
+   ```
+2. **Look before you install** (1 min) — the default run is a dry run: it prints every file it would copy and every launchd job it would write, and changes nothing.
+   ```sh
+   ./install.sh
+   ```
+3. **Install** (1 min)
+   ```sh
+   ./install.sh --apply            # fresh machine
+   ./install.sh --apply --merge    # you already have a ~/.claude: add only what's missing
+   ```
+   This copies commands, agents, hooks, the hub tools (`~/.claude/hub/bin`), routines and templates into `~/.claude`, creates empty memory/ledger/board stubs, fills in your own project-dir name in the scripts that need it, and writes three launchd job files (disk check every 10 min, weekly process review on Mondays, weekly token review on Fridays) into `~/Library/LaunchAgents`. It does **not** load them.
+4. **Fill in the contract** (5 min) — open `~/.claude/OPERATOR.md` and `~/.claude/CLAUDE.md`, replace every `<PLACEHOLDER>` (your name, spending cap, red lines). These two files are the whole system's behavior; the scripts only enforce them.
+5. **Turn on the hooks** (1 min) — merge the hook entries from `settings.json.template` into `~/.claude/settings.json` (or let the installer create it on a fresh machine). Start with the safety hooks (`safety-guard.py`, `model-guard.py`, `mcp-guard.py`).
+6. **Turn on the schedules you want** (1 min)
+   ```sh
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude.disk-guard.plist
+   ```
+   or re-run `./install.sh --apply --force --load` to load all three.
+7. **Check it** — `~/.claude/hub/bin/disk-guard` prints a one-line verdict; `~/.claude/hub/bin/ledger list` prints `(no items)` on a fresh install; `zsh ~/.claude/hub/bin/test-selfcheck.sh` should end `all passed`.
+
+Re-run `git pull && ./install.sh --apply --merge` any time to pick up updates; files you've edited are never overwritten without `--force`. Options: `--dest DIR`, `--launchd-dir DIR`, `--label-prefix P`, `--no-launchd`, `--conservative`.
+
+### Hub tools (`hub/bin/`)
+
+Installed to `~/.claude/hub/bin/` so their internal state paths resolve. All are generic; none touch a network or a git remote.
+
+| tool | what it does |
+|---|---|
+| `ledger` | ticket ledger CLI (`add`, `list`, `status`, `claim`, `proof`, ...) backing the hub's open-items list |
+| `ask-operator` (+ `ask_lib.py`, `ask_redact.py`) | decision queue CLI: files a question with options and a recommended answer to a small web endpoint **you** run (URL and token go in `~/.claude/routines/.env`; without one it has nowhere to send, so skip it or swap the transport in `ask_lib.py`). Anything token-shaped in an answer is moved to the macOS Keychain, not stored |
+| `lane-lock` | one owner per lane (repo/worktree) at a time; stale locks reclaimed |
+| `selfcheck` | refuses to hand work off unless a recorded self-test pass exists for the exact commit |
+| `disk-guard` | read-only free-space verdict (OK / WARN / CRIT) that build dispatchers can gate on |
+| `weekly-process-review` | dry-run-by-default weekly report of test, deploy, disk and token numbers with recommended cuts |
+| `hub-claim` / `hub-who` | session lease so two chats never silently drive one hub |
+| `hub-log-append` | the sanctioned way to land a session log from a context that cannot edit files |
+
+Extra hooks shipped but **not** registered by default (read each header, then add to `settings.json` if you want it): `turn-cap.py`, `subagent-stop-reap.py`, `session-end-reap.py`, `process-register.py`, `peer-batch.py`, `worker-lessons.py`, `log-staleness-enforcer.py`, `inbox-inject.py`, `ask-question-guard.py`.
+
 ## What's here
 
 - **`ONBOARDING.md`** — two paste-prompts that have Claude Code install and personalize all of
@@ -158,9 +205,10 @@ If you'd rather run something deterministic yourself:
 ```sh
 git clone https://github.com/jasonpalmer1/claude-code-setup.git
 cd claude-code-setup
-./install.sh                 # fresh install into ~/.claude
-./install.sh --merge         # additive: never overwrites a file you already have
-./install.sh --dest DIR      # install somewhere other than ~/.claude
+./install.sh                       # dry run: prints the plan, writes nothing
+./install.sh --apply               # fresh install into ~/.claude
+./install.sh --apply --merge       # additive: never overwrites a file you already have
+./install.sh --apply --dest DIR    # install somewhere other than ~/.claude
 ```
 
 It copies every file above into place, `chmod +x`'s the shell/Python/JS hooks, creates an
