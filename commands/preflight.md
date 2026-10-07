@@ -3,7 +3,7 @@ description: Pre-ship gate — checklist distilled from every past shipping inci
 argument-hint: "(run from the project directory; checks the un-shipped diff)"
 ---
 
-Run the pre-ship checklist on the **current project's un-deployed changes** (working tree + commits not yet live). Every item below exists because skipping it once burned the operator with a real person — a client, a friend, or the public. This gate converts those incidents into a deterministic check instead of relying on memory.
+Run the pre-ship checklist on the **current project's un-deployed changes** (working tree + commits not yet live). Every item below exists because skipping it once burned the operator with a real person — a client, a family member, or the public. This gate converts those incidents into a deterministic check instead of relying on memory.
 
 **Read-only against the app; never deploys.** Output is a PASS/FAIL verdict — `/ship` acts on it.
 
@@ -29,7 +29,7 @@ The checklist:
 
 9. **Diff review.** `/code-review` at low/medium effort on the un-shipped diff. Blocking findings = FAIL.
 
-10. **Auth-wall / gate changes: test from a cookie-less isolated context.** If the diff touches any access gate (edge middleware, cookies, auth walls), verify the flow from a FRESH profile with no cookies — and if the site is an installable PWA, reason through the installed-app path explicitly: home-screen apps get an isolated cookie jar, and service workers can cache a gate rejection as the app shell. *Incident: 2026-07-27 my-app edge gate white-screened the operator's & a friend's installed app for 8 days; the SW cached the blank 404 as the shell (fixed 2026-08-04).*
+10. **Auth-wall / gate changes: test from a cookie-less isolated context.** If the diff touches any access gate (edge middleware, cookies, auth walls), verify the flow from a FRESH profile with no cookies — and if the site is an installable PWA, reason through the installed-app path explicitly: home-screen apps get an isolated cookie jar, and service workers can cache a gate rejection as the app shell. *Incident: 2026-07-27 my-app edge gate white-screened the operator's and a family member's installed app for 8 days; the SW cached the blank 404 as the shell (fixed 2026-08-04).*
 
 11. **Eval gate on AI judgment** ([[feedback_eval_gate_question]]). Ask every time, out loud: *does this change let an AI make a judgment call that can be wrong in a way nobody would notice?* If no (deterministic UI, data, layout, copy) → n/a, say so and move on. If yes → there must be a versioned eval set scoring **both** the answer and the path, failures must feed back in as new cases, and a red eval must block the ship. No eval loop on a shipping AI-judgment feature = ⚠️ at minimum, ❌ if it touches money, health, or anything client-facing.
 
