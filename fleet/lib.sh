@@ -329,17 +329,14 @@ fleet_resolve_worktree() {
   fi
 
   local wt_root="${toplevel}-wt"
-  # L-1682 (the operator 2026-10-05, tappable yes): <product-a> lane worktrees default to the
-  # UnionSine USB (jp-build/ws-wt), not the root disk. jp-build-root falls back to the old
-  # path with a loud log line when the drive is not mounted. Other repos are unchanged.
-  # Existing lanes at the old root are reused where they are (never moved) -- see below.
+  # Optional external build drive: set CLAUDE_BUILD_ROOT (default empty = disabled) and lane
+  # worktrees go under $CLAUDE_BUILD_ROOT/wt instead of next to the repo. If the directory is
+  # missing (drive unmounted) we fall back to the normal location. Existing lanes are reused
+  # where they are (never moved) -- see below.
   local old_wt_root="$wt_root"
-  case "$(basename "$toplevel")" in
-    <product-a>)
-      local jp_ws_wt
-      jp_ws_wt="$("${JP_BUILD_ROOT_BIN:-$HOME/.claude/hub/bin/jp-build-root}" ws-wt)" && [ -n "$jp_ws_wt" ] && wt_root="$jp_ws_wt"
-      ;;
-  esac
+  if [ -n "${CLAUDE_BUILD_ROOT:-}" ] && [ -d "$CLAUDE_BUILD_ROOT" ]; then
+    wt_root="$CLAUDE_BUILD_ROOT/wt"
+  fi
   local wt_dir="${wt_root}/${name}"
   local branch="lane/${name}"
   mkdir -p "$wt_root"

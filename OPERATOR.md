@@ -188,8 +188,7 @@ Each is enforced by a script, not by memory.
    `hub/mac-bench-targets.json`. A failed target gets a tested fix, or a written change to the target with
    the reason. No speed fix ships without a before/after number, and no chat blames "the Mac is overloaded"
    without a scorecard reading and the fix already moving.
-5. **Builds live on the USB build drive.** All build and test copies and worktrees default to
-   `/Volumes/UnionSine/jp-build`. Code copies merged or untouched for 7 days are auto-removed; unsaved or
+5. **Builds live on the external build drive (optional).** When `CLAUDE_BUILD_ROOT` is set, all build and test copies and worktrees default to that path (empty = disabled). Code copies merged or untouched for 7 days are auto-removed; unsaved or
    unpushed work is never touched. Exception (the operator 2026-10-05, HQ tap): release builds run only on the
    Mac's own disk, never the USB drive.
 

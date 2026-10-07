@@ -115,21 +115,27 @@ else
   echo "$TAG: SKIP (already exists): CLAUDE.md — see CLAUDE.md.template for sections to merge by hand"
 fi
 
-# --- commands / agents / bin / hub tools / fleet / hooks / routines / templates ---
+# --- commands / agents / hub tools / fleet / hooks / routines / templates ---
 copy_dir "commands" "commands"
 copy_dir "agents" "agents"
-copy_dir "bin" "bin" 1
 copy_dir "hub/bin" "hub/bin" 1
 copy_dir "fleet" "fleet" 1
 copy_dir "hooks" "hooks" 1
 copy_dir "templates" "templates"
 copy_dir "routines" "routines" 1
 
-# --- settings.json ---
+# --- settings.json (additive: hooks and permissions from the template are merged in) ---
 if [ ! -f "$DEST/settings.json" ] || [ "$FORCE" -eq 1 ]; then
   copy_file "settings.json.template" "settings.json"
+elif command -v python3 >/dev/null 2>&1; then
+  echo "$TAG: settings.json exists: merging missing hook entries from settings.json.template (additive, backup written, nothing removed)"
+  if [ "$APPLY" -eq 1 ]; then
+    python3 "$SRC/scripts/merge-settings.py" "$SRC/settings.json.template" "$DEST/settings.json" --apply | sed "s#^#$TAG:   #" || echo "$TAG: settings merge skipped — merge settings.json.template by hand"
+  else
+    python3 "$SRC/scripts/merge-settings.py" "$SRC/settings.json.template" "$DEST/settings.json" | sed "s#^#$TAG:   #" || true
+  fi
 else
-  echo "$TAG: SKIP (already exists): settings.json — merge the hook entries from settings.json.template by hand (or ONBOARDING.md Variant B)."
+  echo "$TAG: SKIP settings.json (no python3) — merge the hook entries from settings.json.template by hand."
 fi
 
 # --- stubs the hooks tolerate being empty ---
