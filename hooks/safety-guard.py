@@ -5,6 +5,117 @@ can't-happen layer for the catastrophic class. TIGHT patterns only: a false posi
 here costs more trust than it saves. Exit 2 = block. Never blocks on its own failure."""
 import json, sys, re, os, subprocess, time, shlex
 
+_FIRMLINK_PREFIX = "/System/Volumes/Data"
+
+
+def _realpath(p):
+    """os.path.realpath plus macOS firmlink normalisation (L-1521): /System/Volumes/Data/<users-dir>/x
+    and /<users-dir>/x are the same file; strip the prefix after resolving so guards see one spelling."""
+    try:
+        sp = os.fspath(p)
+        if isinstance(sp, str) and sp.startswith(_FIRMLINK_PREFIX + "/"):
+            p = sp[len(_FIRMLINK_PREFIX):]
+    except TypeError:
+        pass
+    r = os.path.realpath(p)
+    if r == _FIRMLINK_PREFIX:
+        return "/"
+    if r.startswith(_FIRMLINK_PREFIX + "/"):
+        r = r[len(_FIRMLINK_PREFIX):]
+    return r
+
+
+# --- bare build-shape guard (L-0942 item 3, hub amendment A3) -------------
+# The disk-space incident this ticket closes was concurrent, unenforced
+# `next build`/`wrangler deploy`/etc. run straight from a live session's
+# Bash tool -- no semaphore, no serialization, nothing standing between "the
+# disk is at 15Gi" and "seven more builds start anyway." hub/bin/guarded-build
+# (this same ticket) is the semaphore; this is the other half -- deter the
+# common, visible path of typing a bare build command instead of routing it
+# through the wrapper. Shares ONE regex with model-guard.py's pre-dispatch
+# disk gate via hooks/lib/build_shape.py (see that file's docstring) so the
+# two guards can never drift into disagreeing about what "build-shaped"
+# means. Additive only: every existing check in this file is unchanged.
+#
+# TOKEN-AWARE (2026-09-23, post bug-gate L-0942-a-buggate.md): this used to
+# be a bare substring search over the raw command text, which hard-blocked
+# `grep -r "npm run build" .`, `git commit -m "npm run build"`, and `echo
+# next build`, while `grep guarded-build README.md; npm run build` was
+# silently ALLOWED because the literal substring "guarded-build" appeared
+# ANYWHERE on the line -- exempting a real, unrelated, unguarded build
+# sitting right next to it. Both are now fixed by hooks/lib/build_shape.py's
+# bash_build_match(): it splits the command into shell segments (&&, ||, ;,
+# |, &), quote-aware, and only matches when a segment's OWN command word --
+# not text buried in its arguments -- is a build invocation; the
+# `guarded-build` exemption is likewise per-segment (the segment's own
+# command word must be `guarded-build`), never a line-wide substring check.
+# See that function's docstring for the full behavior, including the
+# `bash -c "..."` recursion case.
+#
+# Import is LAZY (inside the function, not at module top) on purpose, same
+# reason the protected_paths import further down in this file is lazy: this
+# file's own test suite executes the module's top-level code via
+# exec(compile(...), ns) with no __file__ in that namespace (see
+# hooks/test-safety-guard.sh's "layer3" unit test) -- a module-level
+# os.path.dirname(__file__) would NameError before the test ever reaches
+# the thing it's actually testing. Calling it only from inside
+# _bare_build_match means __file__ is only ever touched during a real
+# invocation (python3 safety-guard.py), which always has it.
+#
+# ROUND 3 (hub read-the-code pass): two more fixes, both in the suggested
+# rewrite this guard prints, not in the detector itself.
+#   1. `guarded-build` (bare name) is NOT on PATH -- only ~/.claude/bin is
+#      (~/.claude/hub/bin is not). The old message's literal `guarded-build
+#      -- ...` rewrite would itself fail with "command not found" if the
+#      caller pasted it verbatim. Fixed by always writing the absolute
+#      form, $HOME/.claude/hub/bin/guarded-build, in the message text.
+#   2. For a COMPOUND command (any &&/||/;/|/& control operator), naively
+#      prefixing `guarded-build -- ` only wraps the FIRST segment --
+#      `guarded-build -- cd app && npm run build` still runs `npm run
+#      build` as its own bare, unwrapped segment, which gets blocked again
+#      on the very next attempt (a rewrite loop). Also true, even with
+#      only one segment, for a leading env-assignment prefix (`FOO=1 npm
+#      run build`) -- guarded-build execs its trailing argv directly with
+#      no shell in between, so `FOO=1` as a bare argv0 is just a
+#      nonexistent command, not an env assignment. Fixed by folding the
+#      WHOLE original line into a single nested `bash -c <shlex.quote(...)>`
+#      argument for guarded-build to run as one opaque unit, whenever
+#      hooks/lib/build_shape.py's needs_shell_wrap() says so. See
+#      _guarded_build_rewrite() below.
+#   3. This whole detection+message-building block now fails OPEN on any
+#      internal exception (see the try/except around its call site,
+#      further down this file) -- a broken or missing
+#      hooks/lib/build_shape.py must never crash this hook or block a
+#      command it can't even evaluate; it logs to stderr and allows.
+GUARDED_BUILD_DISPLAY_PATH = "$HOME/.claude/hub/bin/guarded-build"
+
+
+def _bare_build_match(cmd):
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+    from build_shape import bash_build_match
+    return bash_build_match(cmd)
+
+
+def _guarded_build_rewrite(cmd, cleanup=False):
+    """Build the suggested guarded-build rewrite text for `cmd` (round 3
+    bug-gate fix). Always uses the absolute GUARDED_BUILD_DISPLAY_PATH,
+    never the bare `guarded-build` name, since only ~/.claude/bin is on
+    PATH. Whenever hooks/lib/build_shape.py's needs_shell_wrap() says so
+    (a compound command, OR a single segment with a leading env-assignment
+    prefix like `FOO=1 npm run build` -- guarded-build execs its trailing
+    argv directly with no shell in between, so an env-assignment prefix
+    would otherwise just be a nonexistent argv0), the whole original line
+    is folded into a single nested `bash -c <shlex.quote(cmd)>` argument
+    instead of being naively prefixed, so the rewrite is both re-block-
+    loop-proof AND actually runs the way it looks like it should."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+    from build_shape import needs_shell_wrap
+    flag = "--cleanup " if cleanup else ""
+    if needs_shell_wrap(cmd):
+        return f"{GUARDED_BUILD_DISPLAY_PATH} {flag}-- bash -c {shlex.quote(cmd)}"
+    return f"{GUARDED_BUILD_DISPLAY_PATH} {flag}-- {cmd}"
+
+
 CATASTROPHIC = [
     # rm -rf (any flag order) aimed at /, ~, or $HOME roots
     r"rm\s+-[a-zA-Z]*[rf][a-zA-Z]*[rf][a-zA-Z]*\s+(/|~/?|\$HOME/?)\s*$",
@@ -17,7 +128,7 @@ CATASTROPHIC = [
     r"chmod\s+(-R\s+)?777\s+/\s*$",
 ]
 # --- ClickFix / remote-execution one-liners (2026-09-09) -------------------
-# ClickFix (a known social-engineering pattern): a web page tells a human it needs a
+# ClickFix is a common social-engineering pattern: a web page tells a human it needs a
 # "fix" or a human check, hands them a command, and the human pastes it into
 # a terminal. The payload is never read by anyone before it runs.
 #
@@ -82,7 +193,7 @@ CRED_WORD = (
 # the hardcoded-constant form and the compare-against-a-literal form, which is
 # how the client-side admin gate leaked.
 CREDENTIAL_LINE = re.compile(
-    r"(?i)\b" + CRED_WORD + r"\b[^\n]{0,24}?(?:==|===|!=|!==|=|:)\s*"
+    r"(?i)\b" + CRED_WORD + r"\b[^\n{}\[\]]{0,24}?(?:==|===|!=|!==|=|:)\s*"
     r"(?P<q>[\"'`])(?P<val>[^\"'`\n]{2,60})(?P=q)"
 )
 
@@ -287,11 +398,11 @@ def _settings_real_targets():
     """Real, resolved settings.json / settings.local.json paths under the
     real HOME -- computed at call time from os.path.expanduser("~"), same
     pattern as _rites_allowed, so a scratch-HOME test gets its own set."""
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = _realpath(os.path.expanduser("~"))
     claude = os.path.join(home, ".claude")
     return {
-        os.path.realpath(os.path.join(claude, "settings.json")),
-        os.path.realpath(os.path.join(claude, "settings.local.json")),
+        _realpath(os.path.join(claude, "settings.json")),
+        _realpath(os.path.join(claude, "settings.local.json")),
     }
 
 
@@ -425,7 +536,7 @@ def _is_settings_operand(token):
     for candidate in _brace_expand(expanded):
         cand = _expand_home_token(candidate)
         try:
-            real = os.path.realpath(cand)
+            real = _realpath(cand)
         except Exception:
             real = cand
         if real in _settings_real_targets():
@@ -814,6 +925,16 @@ def _settings_write_destination(cmd, depth=6):
     return False
 
 
+# L-1503: a detector for model-issued fleet-settings-check/fleet-upgrade
+# --fix invocations was built and tested here, but wiring its call site into
+# this guard's dispatch is a settings-restore-shaped edit the harness's own
+# classifier refuses from a model tool call ([Security Weaken] /
+# [Instruction Poisoning], three attempts, see hub/reports/L-1503/
+# build-report.md) -- so it is intentionally absent rather than shipped
+# unwired. the operator runs `fleet-settings-check --fix` himself; --fix's own
+# hash-pinned golden spec is the defense-in-depth regardless of this gap.
+
+
 # the operator, 2026-09-23, verbatim: "Several chats have still been asking me to
 # approve commands. make sure this doesn't happen again. they are all
 # approved forever. period." No hook may pop a permission prompt for him.
@@ -822,6 +943,81 @@ def _settings_write_destination(cmd, depth=6):
 # BLOCK instead of a question. Blocking tightens the guard, it never
 # loosens it: the call is refused with a reason and a concrete alternative,
 # never left waiting on a tappable "ask".
+# --- git stash in ~/.claude (L-1703) --------------------------------------
+# ~/.claude is ONE repo shared by every live chat. A whole-repo `git stash`
+# there hides other sessions' files until popped (two workers did this
+# 2026-10-05). Block every stash verb except list/show when the effective repo
+# is ~/.claude. Worktrees of ~/.claude elsewhere are outside the tree: allowed.
+_STASH_MSG = ("git stash is blocked in ~/.claude (shared by every live chat). "
+              "Commit only your own files or use a worktree.")
+_STASH_READONLY = {"list", "show"}
+_GIT_OPTS_WITH_ARG = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
+
+def _in_claude_repo(path):
+    try:
+        root = _realpath(os.path.expanduser("~/.claude"))
+        r = _realpath(os.path.expanduser(path))
+        return r == root or r.startswith(root + os.sep)
+    except Exception:
+        return False
+
+
+def _stash_in_claude(cmd, cwd, depth=4):
+    import shlex
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        toks = cmd.split()
+    cur = cwd or os.getcwd()
+    seg, segs = [], []
+    for t in toks:
+        if t and set(t) <= set("&|;()"):
+            segs.append(seg); seg = []
+        else:
+            seg.append(t)
+    segs.append(seg)
+    for seg in segs:
+        while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+            seg = seg[1:]
+        while seg and seg[0] in ("command", "builtin", "exec", "time", "nohup", "env"):
+            seg = seg[1:]
+        if not seg:
+            continue
+        w = os.path.basename(seg[0])
+        if w in ("cd", "pushd") and len(seg) > 1:
+            tgt = os.path.expanduser(seg[1])
+            cur = tgt if os.path.isabs(tgt) else os.path.join(cur, tgt)
+            continue
+        if w in ("bash", "sh", "zsh") and depth > 0 and "-c" in seg:
+            i = seg.index("-c")
+            if i + 1 < len(seg) and _stash_in_claude(seg[i + 1], cur, depth - 1):
+                return True
+            continue
+        if w != "git":
+            continue
+        eff = cur
+        i = 1
+        while i < len(seg) and seg[i].startswith("-"):
+            o = seg[i]
+            if o == "-C" and i + 1 < len(seg):
+                a = os.path.expanduser(seg[i + 1])
+                eff = a if os.path.isabs(a) else os.path.join(eff, a)
+            if o in _GIT_OPTS_WITH_ARG:
+                i += 1
+            i += 1
+        if i >= len(seg) or seg[i] != "stash":
+            continue
+        sub = seg[i + 1] if i + 1 < len(seg) else ""
+        if sub in _STASH_READONLY:
+            continue
+        if _in_claude_repo(eff):
+            return True
+    return False
+
+
 def _refuse(reason):
     print("Blocked (safety guard): " + reason, file=sys.stderr)
     sys.exit(2)
@@ -937,6 +1133,28 @@ CLAUDE_SUBCMD = re.compile(
     r"(^|/)claude\s+(agents|mcp|config|doctor|update|install|plugin|rc|api|"
     r"migrate-installer|setup-token|help|--version|--help|-v|-h)\b")
 KILL_LOG = os.path.expanduser("~/.claude/hub/chat-kill-guard.log")
+
+# close-chat (hub/bin/close-chat, L-1395, the operator 2026-09-27: "I literally want
+# you to be able to close the full chat") IS the front door now, alongside
+# the phone/web close and /clear-or-exit named above. It writes its own
+# rites stub (a closing summary carrying the ❌❌❌ DEAD marker, saved under
+# hub/closed-chats/ — added to _rites_allowed below) BEFORE it ever signals
+# the target pid, then sends TERM/KILL itself. A bare invocation of it is
+# therefore pre-approved and never needs an inline RITES-DONE/HUNG-CHAT-OVERRIDE
+# marker in the SAME bash call — the proof is produced by the tool's own next
+# step, not by the caller. Scoped tightly on purpose: the WHOLE command must
+# be nothing but a close-chat invocation (no compounding, redirection, or
+# substitution), so this can never be used to smuggle an unrelated raw kill
+# past the guard by chaining it onto a close-chat call. Raw kill/pkill/killall
+# aimed at a live chat, anywhere else, is still blocked exactly as before.
+CLOSE_CHAT_RE = re.compile(r"^(?:\S+/)?close-chat\b")
+
+
+def _is_bare_close_chat(c: str) -> bool:
+    s = c.strip()
+    if not CLOSE_CHAT_RE.match(s):
+        return False
+    return not re.search(r"[;&|`\n]|\$\(", s)
 # 2026-09-16 guard-fixes item 7: the outer except below silently swallowed
 # every unplanned exception (a regression here means this guard protects
 # nothing, invisibly). This is a pure observability addition — same
@@ -1057,18 +1275,25 @@ def _rites_allowed(path):
     Computed from os.path.expanduser("~") at call time, not a module-level
     constant, so a test pointing HOME at a scratch dir gets its own
     allowlist, not the real machine's."""
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = _realpath(os.path.expanduser("~"))
     hub = os.path.join(home, ".claude", "hub")
-    real = os.path.realpath(path)
+    real = _realpath(path)
     fixed = {
-        os.path.realpath(os.path.join(hub, "board.md")),
-        os.path.realpath(os.path.join(hub, "board-archive.md")),
-        os.path.realpath(os.path.join(hub, "delegation-alarms.log")),
+        _realpath(os.path.join(hub, "board.md")),
+        _realpath(os.path.join(hub, "board-archive.md")),
+        _realpath(os.path.join(hub, "delegation-alarms.log")),
     }
     if real in fixed:
         return True
-    reports_dir = os.path.realpath(os.path.join(hub, "reports"))
-    return os.path.dirname(real) == reports_dir and real.endswith(".md")
+    reports_dir = _realpath(os.path.join(hub, "reports"))
+    if os.path.dirname(real) == reports_dir and real.endswith(".md"):
+        return True
+    # L-1395: close-chat's own closing stub — the RITES-DONE proof it writes
+    # for itself before it ever signals a target pid (see close-chat and the
+    # _is_bare_close_chat exemption above). Same shape as reports/: a direct
+    # child only, .md only, no nested subdirectory or symlink-out.
+    closed_chats_dir = _realpath(os.path.join(hub, "closed-chats"))
+    return os.path.dirname(real) == closed_chats_dir and real.endswith(".md")
 
 
 # Hub audit amendment A5: "DEAD" in content.upper() is satisfied by
@@ -1093,7 +1318,16 @@ def _rites_proof(cmd, targets):
     m = re.search(r"RITES-DONE:\s*(\S+)", cmd)
     if not m:
         return None
-    path = os.path.expanduser(m.group(1).strip("\"',;"))
+    # L-1313: a valid path was rejected because the \S+ capture kept trailing shell
+    # punctuation ( ) ` : . ) or a literal $HOME / ${HOME}. Strip the punctuation and
+    # expand HOME only (never arbitrary env vars).
+    raw = m.group(1).strip("\"',;)`:.")
+    home_dir = os.path.expanduser("~")
+    for tok in ("${HOME}", "$HOME"):
+        if raw.startswith(tok):
+            raw = home_dir + raw[len(tok):]
+            break
+    path = os.path.expanduser(raw)
     try:
         # layer 1: path allowlist — a throwaway file anywhere else no longer
         # qualifies, regardless of content.
@@ -1127,9 +1361,9 @@ def _worktree_guard_test(path):
     realpath, so a symlink or '..' out of the worktrees dir never qualifies, and a
     lookalike tree elsewhere fails the prefix and the .git back-pointer."""
     try:
-        home = os.path.realpath(os.path.expanduser("~"))
+        home = _realpath(os.path.expanduser("~"))
         wt_root = os.path.join(home, ".claude-worktrees") + os.sep
-        real = os.path.realpath(os.path.expanduser(path))
+        real = _realpath(os.path.expanduser(path))
         if not real.startswith(wt_root):
             return False
         parts = real[len(wt_root):].split(os.sep)
@@ -1137,8 +1371,8 @@ def _worktree_guard_test(path):
             return False
         with open(os.path.join(wt_root, parts[0], ".git")) as fh:
             gitdir = fh.read().strip()
-        want = os.path.join(os.path.realpath(os.path.join(home, ".claude", ".git")), "worktrees") + os.sep
-        return gitdir.startswith("gitdir:") and os.path.realpath(gitdir[7:].strip()).startswith(want)
+        want = os.path.join(_realpath(os.path.join(home, ".claude", ".git")), "worktrees") + os.sep
+        return gitdir.startswith("gitdir:") and _realpath(gitdir[7:].strip()).startswith(want)
     except Exception:
         return False
 
@@ -1195,6 +1429,43 @@ try:
                 )
                 sys.exit(2)
 
+        # L-0926 (round 8): tokenizer-based second look at recursive rm of /, ~, $HOME
+        # (catches substitution/xargs/find-exec/flag-case shapes the regexes above miss).
+        # Fails open on any internal error, like the L-0925 guard below.
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+            from protected_paths import catastrophic_rm
+            if catastrophic_rm(cmd, data.get("cwd") or os.getcwd()):
+                print(
+                    "Blocked (safety guard): command matches a catastrophic pattern "
+                    "(recursive rm of /, ~ or $HOME, tokenizer check). "
+                    "If genuinely intended, the operator runs it by hand with the `!` prefix.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        except SystemExit:
+            raise
+        except Exception as _e:
+            _log_failopen(_e)
+
+        # L-0952 (2026-09-23 incident): `pgrep -fl` / `pgrep -fa` and `ps eww` print a process's
+        # full command line/environment, which put an API key into a transcript. Pids only.
+        for _pat in (
+            r"(^|[;&|(\s])pgrep\s+(-[a-zA-Z]*f[a-zA-Z]*[la][a-zA-Z]*|-[a-zA-Z]*[la][a-zA-Z]*f[a-zA-Z]*)\b",
+            r"(^|[;&|(\s])pgrep\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[la]\b",
+            r"(^|[;&|(\s])pgrep\s+(-[a-zA-Z]+\s+)*-[la]\s+(-[a-zA-Z]+\s+)*-f\b",
+            r"(^|[;&|(\s])ps\s+(-?[a-zA-Z]*e[a-zA-Z]*ww|-?[a-zA-Z]*ww[a-zA-Z]*e)\b",
+            r"(^|[;&|(\s])ps\s+[^|;&\n]*\bewww?\b",
+        ):
+            if re.search(_pat, cmd):
+                print(
+                    "Blocked (safety guard): `pgrep -fl`/`pgrep -fa` and `ps eww` print process "
+                    "command lines/environments, which can put a secret into the transcript. "
+                    "Use `pgrep -f <pat>` (pids only) or `ps -o pid=,etime= -p <pid>`.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
         # ClickFix class: downloaded code executed without anyone reading it.
         for pat, why in REMOTE_EXEC:
             if re.search(pat, cmd, re.IGNORECASE):
@@ -1215,6 +1486,76 @@ try:
                     file=sys.stderr,
                 )
                 sys.exit(2)
+
+        # git stash in ~/.claude (L-1703): fails open on internal error.
+        try:
+            _stash_hit = _stash_in_claude(cmd, data.get("cwd") or os.getcwd())
+        except Exception:
+            _stash_hit = False
+        if _stash_hit:
+            print(_STASH_MSG, file=sys.stderr)
+            sys.exit(2)
+
+        # bare build-shape guard (L-0942 item 3, hub amendment A3): a
+        # build-shaped Bash command that does not route through
+        # hub/bin/guarded-build. The message gives the EXACT rewrite, per
+        # A3, so the caller can re-issue immediately rather than guess.
+        #
+        # Round 3: this whole block fails OPEN on any internal exception
+        # (a broken/missing hooks/lib/build_shape.py import, a tokenizer
+        # bug, anything unforeseen) -- logged to stderr, never sys.exit(2),
+        # never an uncaught traceback. sys.exit(2) below is unaffected:
+        # SystemExit is a BaseException, not an Exception, so a real,
+        # deliberate block is never intercepted by this except clause.
+        try:
+            build_match = _bare_build_match(cmd)
+            if build_match:
+                rewrite = _guarded_build_rewrite(cmd)
+                rewrite_cleanup = _guarded_build_rewrite(cmd, cleanup=True)
+                print(
+                    "Blocked (build-shape guard, L-0942): this command looks build-shaped "
+                    f"('{build_match}') and does not go through the disk-aware build "
+                    "semaphore (hub/bin/guarded-build). Unenforced concurrent builds are what "
+                    "drove the disk to CRIT and caused last night's incident.\n"
+                    "Rewrite as:\n"
+                    f"  {rewrite}\n"
+                    "(add --cleanup right after guarded-build to also delete .next/out when the "
+                    f"build finishes: {rewrite_cleanup})",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        except Exception as e:
+            print(
+                f"build-shape guard: internal error ({e!r}) -- failing open "
+                "(allowing this command) rather than blocking on a bug in the "
+                "guard itself; this is a bug worth fixing, never a reason to "
+                "freeze the fleet.",
+                file=sys.stderr,
+            )
+
+        # 4f5c3ff3 transcript fence (2026-09-29, hub ask after the 2nd slip): any raw `rclone`
+        # copy/sync/move is checked by hub/bin/rclone-safe --check. Refuses if the local source
+        # holds 4f5c3ff3 files and there is no --exclude '*4f5c3ff3*'. Fails OPEN on a hook-side
+        # error (never freezes the fleet); the wrapper itself fails closed.
+        try:
+            if "rclone" in cmd and "rclone-safe" not in cmd:
+                import shlex as _shlex, subprocess as _sp
+                for _seg in re.split(r"[;&|\n]+", cmd):
+                    try:
+                        _tk = _shlex.split(_seg)
+                    except ValueError:
+                        continue
+                    _ix = [i for i, t in enumerate(_tk) if os.path.basename(t) == "rclone"]
+                    if not _ix:
+                        continue
+                    _r = _sp.run([os.path.expanduser("~/.claude/hub/bin/rclone-safe"), "--check"] + _tk[_ix[0] + 1:],
+                                 capture_output=True, text=True, timeout=150)
+                    if _r.returncode == 2:
+                        _refuse(_r.stderr.strip() or "rclone-safe refused this transfer (4f5c3ff3 fence)")
+        except SystemExit:
+            raise
+        except Exception as _e:
+            _log_failopen(_e)
 
         # settings.json / settings.local.json write-target check (item 1,
         # tokenizer-based since guard-fixes step 13 -- see
@@ -1241,6 +1582,14 @@ try:
                 "the exact change into a hub/READY-FOR-OPERATOR-*.md note and "
                 "tell the hub."
             )
+
+        # L-0925 disk-delete guard (2026-09-23 incident) -- fails open via this file's own wrapper.
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
+        from protected_paths import check_command
+        blocked, reason = check_command(cmd, data.get("cwd") or os.getcwd())
+        if blocked:
+            print(reason, file=sys.stderr)
+            sys.exit(2)
 
         # secret-read check (item 2) — after settings-write, before kill-guard.
         # 2026-09-16 guard-fixes step 10, bug-gate 4b: the old ENV_TO_ENV_COPY
@@ -1272,7 +1621,9 @@ try:
 
         # A chat must not die by bash kill — it dies through the front door,
         # after its rites land. See the chat-kill guard block above.
-        if KILL_ANY.search(cmd):
+        if _is_bare_close_chat(cmd):
+            _note("close-chat invocation allowed (produces its own rites proof): %s" % cmd[:160])
+        elif KILL_ANY.search(cmd):
             targets = _chat_targets(cmd)
             if targets:
                 if "HUNG-CHAT-OVERRIDE" in cmd:

@@ -1,0 +1,88 @@
+#!/bin/zsh
+# selfcheck (L-1776 S1): builder self-gate for ~/.claude tooling + hub dispatch precheck.
+#   selfcheck run --repo <path> [--ticket L-N] <test-*.sh | script.py>...
+#       zsh runs *.sh (as the hub's tests run); /usr/bin/python3 runs *.py (as launchd does).
+#       Writes <git-common-dir>/selfcheck/<HEAD sha> = {sha,exit,clean,ticket,ts,ran[]}.
+#   selfcheck precheck --repo <path> --sha <sha>
+#       Exit 0 + "OK ..." only if a pregate (<product-a>) or selfcheck record exists for that
+#       exact sha, has the sha inside, exit 0 (selfcheck), and was not recorded on a dirty tree.
+#       Otherwise prints "REFUSED: <reason>" and exits 2. A bare touched file never passes.
+emulate -L zsh
+setopt pipefail
+PY=/usr/bin/python3
+LOG=${SELFGATE_LOG:-$HOME/.claude/hub/state/selfgate.log}
+log() { { mkdir -p ${LOG:h} && print -r -- "$(date -u +%FT%TZ) $*" >> $LOG; } 2>/dev/null; }
+
+(( $# )) || { print "REFUSED: usage: selfcheck run|precheck --repo <path> ..."; exit 64; }
+mode=$1; shift
+repo=; sha=; ticket=-; files=()
+while (( $# )); do
+  case $1 in
+    --repo) (( $# >= 2 )) || { print "REFUSED: --repo needs a value"; exit 64; }; repo=$2; shift 2;;
+    --sha) (( $# >= 2 )) || { print "REFUSED: --sha needs a value"; exit 64; }; sha=$2; shift 2;;
+    --ticket) (( $# >= 2 )) || { print "REFUSED: --ticket needs a value"; exit 64; }; ticket=$2; shift 2;;
+    *) files+=($1); shift;;
+  esac
+done
+[[ -n $repo && -d $repo ]] || { print -u2 "selfcheck: --repo <path> required"; exit 64; }
+common=$(git -C $repo rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+  || { print "REFUSED: $repo is not a git repo"; exit 2; }
+
+case $mode in
+run)
+  head=$(git -C $repo rev-parse HEAD) || exit 1
+  [[ -z $(git -C $repo status --porcelain) ]] && clean=true || clean=false
+  rc=0; ran=()
+  for f in $files; do
+    [[ $f = /* ]] || f=$repo/$f
+    f=${f:A}
+    case $f in ${repo:A}/*) ;; *) print "REFUSED: test path $f is outside the repo"; exit 64;; esac
+    case $f in
+      *.sh) (cd $repo && zsh $f); r=$?;;
+      *.py) (cd $repo && $PY $f); r=$?;;
+      *) print -u2 "selfcheck: don't know how to run $f"; r=64;;
+    esac
+    print "selfcheck: $f exit $r"
+    ran+=($f); (( r > rc )) && rc=$r
+  done
+  [[ ${#files} -gt 0 ]] || { print -u2 "selfcheck: no test files given"; rc=64; }
+  mkdir -p $common/selfcheck
+  rec=$common/selfcheck/$head
+  SC_SHA=$head SC_EXIT=$rc SC_CLEAN=$clean SC_TICKET=$ticket SC_RAN="${(j:|:)ran}" $PY -c '
+import json,os,datetime
+print(json.dumps({"sha":os.environ["SC_SHA"],"exit":int(os.environ["SC_EXIT"]),"clean":os.environ["SC_CLEAN"]=="true","ticket":os.environ["SC_TICKET"],"ts":datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),"ran":[x for x in os.environ["SC_RAN"].split("|") if x]}))' > $rec
+  print "selfcheck: record $rec (exit=$rc clean=$clean)"
+  log "selfcheck_run ticket=$ticket sha=$head exit=$rc clean=$clean"
+  exit $rc;;
+precheck)
+  [[ -n $sha ]] || { print "REFUSED: no --sha given"; exit 2; }
+  refuse() { print "REFUSED: $1"; log "selfgate_refused repo=$repo sha=$sha reason=$1"; exit 2; }
+  [[ $sha =~ '^[0-9a-f]{40}$' ]] || refuse "sha must be a full 40-hex sha"
+  git -C $repo cat-file -e $sha^{commit} 2>/dev/null || refuse "sha is not a commit in $repo"
+  head=$(git -C $repo rev-parse HEAD)
+  if [[ $head == $sha && -n $(git -C $repo status --porcelain) ]]; then
+    refuse "working tree is dirty now at $sha (changes are not what was gated)"
+  fi
+  found=
+  for kind in pregate selfcheck; do
+    [[ -f $common/$kind/$sha && -s $common/$kind/$sha ]] && { found=$kind; break; }
+  done
+  [[ -n $found ]] || refuse "no pregate/selfcheck record for $sha (missing or empty)"
+  out=$(SC_KIND=$found SC_SHA=$sha $PY -c '
+import json,os,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception as e: print("record is not valid JSON"); sys.exit(1)
+if not isinstance(d,dict): print("record is not a JSON object"); sys.exit(1)
+if d.get("sha")!=os.environ["SC_SHA"]: print("record sha %r does not match" % d.get("sha")); sys.exit(1)
+if d.get("clean") is False: print("tree was dirty when the record was written"); sys.exit(1)
+if "exit" in d and d["exit"]!=0: print("record exit code is %r, not 0" % d["exit"]); sys.exit(1)
+if os.environ["SC_KIND"]=="selfcheck":
+    if d.get("exit")!=0 or d.get("clean")!=True: print("selfcheck record lacks exit=0 and clean=true"); sys.exit(1)
+else:
+    if not d.get("checks"): print("pregate record lists no checks"); sys.exit(1)
+' $common/$found/$sha) || refuse "$found record invalid: $out"
+  print "OK: $found record valid for $sha"
+  log "selfgate_pass repo=$repo sha=$sha kind=$found"
+  exit 0;;
+*) print "REFUSED: usage: selfcheck run|precheck --repo <path> ..."; exit 64;;
+esac

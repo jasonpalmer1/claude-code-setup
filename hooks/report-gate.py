@@ -62,6 +62,7 @@ import os
 import re
 import glob
 import fcntl
+import stat
 import time
 import datetime
 
@@ -116,7 +117,73 @@ CLOCK_SKEW_MS = 2000  # a report legitimately written in the same second as star
 # Platform: st_birthtime exists on macOS/APFS (where this hook runs). On a
 # filesystem without it, created_this_run falls back to mtime and the
 # in-place-append bypass reopens there.
-AUTO_DIR = os.path.expanduser("~/.claude/hub/reports/workers")
+# FIX 7 (2026-09-23, L-0928, HUB AUDIT H1): isolated `claude -p` tests
+# (hub/bin/claude-test) need their proof reports to land in a throwaway temp
+# dir instead of this live AUTO_DIR, so a test run never pollutes the real
+# hub/reports/workers/ tree the way L-0917's tests did (see
+# feedback_no_bypass_permissions_in_tests.md). REPORT_GATE_AUTO_DIR is
+# honoured ONLY when ALL of these hold — H1's explicit requirement is that a
+# normal session with the env var set but NO marker must still get the LIVE
+# default, silently:
+#   (a) its realpath resolves under the realpath of /tmp, /private/tmp, or
+#       $TMPDIR (never anywhere in the live tree);
+#   (b) CLAUDE_TEST_HARNESS is set (non-empty) in the environment;
+#   (c) a file named .claude-test-marker in the PARENT of that reports dir
+#       (i.e. claude-test's own run dir) exists, is a REGULAR file (checked
+#       with lstat, so a symlink never counts as regular no matter what it
+#       points at), is owned by the CURRENT uid, and its content equals
+#       CLAUDE_TEST_HARNESS exactly (no stripping).
+# Every check below fails CLOSED to the live default on ANY exception —
+# this override can only ever make the override *harder* to satisfy, never
+# easier, so a bug in this function can never silently redirect a real
+# worker's proof report away from where the hub looks.
+def _resolve_auto_dir() -> str:
+    default = os.path.expanduser("~/.claude/hub/reports/workers")
+    try:
+        override = os.environ.get("REPORT_GATE_AUTO_DIR")
+        harness = os.environ.get("CLAUDE_TEST_HARNESS")
+        if not override or not harness:
+            return default
+
+        real_override = os.path.realpath(override)
+
+        tmp_roots = []
+        for cand in ("/tmp", "/private/tmp", os.environ.get("TMPDIR")):
+            if not cand:
+                continue
+            try:
+                tmp_roots.append(os.path.realpath(cand))
+            except Exception:
+                continue
+        if not tmp_roots:
+            return default
+        under_tmp = any(
+            real_override == root or real_override.startswith(root.rstrip("/") + "/")
+            for root in tmp_roots
+        )
+        if not under_tmp:
+            return default
+
+        parent = os.path.dirname(real_override.rstrip("/")) or "/"
+        marker = os.path.join(parent, ".claude-test-marker")
+
+        st = os.lstat(marker)  # lstat, never stat: a symlink must not count
+        if not stat.S_ISREG(st.st_mode):
+            return default
+        if st.st_uid != os.getuid():
+            return default
+
+        with open(marker, "r") as f:
+            content = f.read()
+        if content != harness:
+            return default
+
+        return override
+    except Exception:
+        return default
+
+
+AUTO_DIR = _resolve_auto_dir()
 
 # FIX 4 (2026-09-07, the operator approved): FIX 3's widening broke path SELECTION.
 # With the old reports/-only pattern, `.search()` (first match) was harmless
@@ -148,6 +215,13 @@ def log(line: str) -> None:
             f.write(f"{ts} {line}\n")
     except Exception:
         pass
+
+
+def log_pass(line: str) -> None:
+    """L-1578 (2026-10-01): non-blocking outcomes (PASS / EXEMPT / ALLOW-NO-TYPE) are
+    logged only when REPORT_GATE_LOG_ALL=1; BLOCK / LOOP-BREAK / ERROR always log."""
+    if os.environ.get("REPORT_GATE_LOG_ALL") == "1":
+        log(line)
 
 
 def extract_text(content) -> str:
@@ -316,9 +390,18 @@ def main() -> int:
         if tpath:
             prompt_text, start_ms = read_prompt_and_start(tpath)
 
+        # --- L-1559 item 8: fast path. A stop with NO agent_type and NO findable transcript is
+        # not a real typed worker (32,852 of 35,663 stops since 09-22 looked like this and were
+        # spent a forced continuation turn each). With no transcript there is no brief, so no
+        # named report path can be judged anyway; every named-path check below stays fail-closed
+        # for typed workers and for anything with a transcript.
+        if not agent_type and not tpath:
+            log_pass(f"ALLOW-NO-TYPE id={agent_id} session={session_id}")
+            return 0
+
         # --- exemption: "report: none" in the brief, checked before path search ---
         if prompt_text and _is_exempt(prompt_text):
-            log(f"EXEMPT agent={display_name} id={agent_id} source=prompt")
+            log_pass(f"EXEMPT agent={display_name} id={agent_id} source=prompt")
             return 0
 
         # --- FIX 5: the per-agent auto report path counts if created this run ---
@@ -327,7 +410,7 @@ def main() -> int:
         # file pass another (the FIX 2 false PASS). Bug-gate L-0809 FAIL 1.
         auto = auto_report_path(agent_id) if (agent_id and start_ms is not None) else None
         if auto and created_this_run(auto, start_ms) and _has_real_content(auto):
-            log(f"PASS agent={display_name} id={agent_id} report={auto} pick=auto")
+            log_pass(f"PASS agent={display_name} id={agent_id} report={auto} pick=auto")
             return 0
         if auto:
             try:
@@ -377,7 +460,7 @@ def main() -> int:
         ncand = len(REPORT_PATH_RE.findall(prompt_text or ""))
 
         if created_this_run(report_path, start_ms) and _has_real_content(report_path):
-            log(f"PASS agent={display_name} id={agent_id} report={report_path} "
+            log_pass(f"PASS agent={display_name} id={agent_id} report={report_path} "
                 f"pick={pick_rule} candidates={ncand}")
             return 0
 
