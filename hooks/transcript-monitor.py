@@ -4,7 +4,7 @@
 the operator, 2026-08-11: "every single chat ... constantly monitored ... checkpoint
 run once we hit that spot." Mechanizes feedback_clear_signal_last_line's
 thresholds (~$45/MB on his ledger): >=1.5MB = checkpoint due at this pause;
->=3MB = log NOW and keep working (2026-09-23: never instruct /clear). Silent below threshold.
+>=3MB = log NOW and keep working (2026-09-23: never instruct /clear). Silent below threshold; once per crossing.
 
 UserPromptSubmit hook: stdout is injected as context for the model.
 Exit 0 always — monitoring must never block a prompt.
@@ -29,6 +29,23 @@ def main() -> int:
     except Exception:
         return 0  # never block on our own failure
 
+    # the operator 2026-10-05 (tap 22): warn ONCE per threshold crossing per session (WARN, then HARD), not on every
+    # prompt. State lives in ~/.claude/hub/state/hooknote-cache/<session>.tmon.json. A SessionStart reset
+    # (compaction) clears it via emit_once.reset, so the warning can fire again after a compact.
+    tier = 2 if size >= HARD_BYTES else 1 if size >= WARN_BYTES else 0
+    if tier:
+        try:
+            import re
+            sid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(payload.get("session_id") or "nosession"))[:80]
+            d = os.path.expanduser("~/.claude/hub/state/hooknote-cache")
+            os.makedirs(d, exist_ok=True)
+            sp = os.path.join(d, f"{sid}.tmon.json")
+            last = int(open(sp).read() or 0) if os.path.exists(sp) else 0
+            if tier <= last:
+                return 0
+            open(sp, "w").write(str(tier))
+        except Exception:
+            pass
     # the operator 2026-09-23 (standing rule, explicit yes): chats NEVER stop to ask him to /clear.
     # At threshold: write the log, then KEEP WORKING; auto-compact handles context (L-0802).
     if size >= HARD_BYTES:

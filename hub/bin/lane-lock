@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""lane-lock — mechanical per-repo/lane ownership claim + gate-fail circuit
+breaker (L-0310, "Build lane-lock + gate-fail circuit breaker", the operator
+approved 2026-09-15).
+
+WHY THIS EXISTS (gap this ticket asked for, confirmed missing on 2026-09-27
+before this was written — see hub/reports/hub/2026-09-27-l0310.md):
+
+  - LANES.md's "one owner per repo at a time" was enforced only by a human/
+    agent reading free text, never mechanically. The 2026-09-21 21:19
+    collision (two `npm run build` in one <product-a> worktree, root cause
+    logged in LANES.md as "the ledger said owner: unowned, so nothing on
+    disk said the lane was taken") is the exact failure mode a real lock
+    would have caught before the second build ever started.
+  - Nothing tracked a FAIL streak on bug-gate/playtester results per lane,
+    so nothing could mechanically stop a worker from retrying a deploy into
+    a lane whose last two gate results were both FAIL. the operator's own rule
+    ("A failed bug check or UI check blocks the ship, even for something
+    the operator asked for" — feedback_three_gate_agents.md) was honored only by
+    each gate agent's own report, never enforced by a shared switch that
+    later claims must check.
+
+This tool is deliberately narrow and reuses existing conventions rather than
+inventing new ones:
+  - Dead-holder self-heal (a lock whose owner pid no longer resolves is
+    cleared automatically) — same pattern as hub/bin/ws-build-slot and
+    hub_lease_lib.py's pid/heartbeat dead-check, just pid-liveness only
+    (no heartbeat staleness window) since a lane claim has no expected
+    heartbeat cadence the way the single-hub lease does.
+  - Alarm line on trip goes to delegation-alarms.log, the SAME file
+    hub_lease_lib.append_alarm() already writes to for lease anomalies —
+    one alarm surface, not a second one.
+  - Every path is env-overridable (LANE_LOCK_ROOT, LANE_LOCK_ALARMS_LOG,
+    LANE_BREAKER_THRESHOLD) so tests never touch production state — same
+    convention as disk-guard's DISK_GUARD_VOLUME / hub_lease_lib's
+    HUB_LEASE_PATH.
+
+WHAT IT DOES NOT DO: it does not replace ws-build-slot (that's a machine-
+wide BUILD CONCURRENCY semaphore, one slot, any lane) or hub-claim (that's
+the single-hub SESSION lease, exactly one global holder). This is a named,
+per-LANE (repo/ticket-scope) ownership + gate-health switch. A lane name is
+just a string the caller picks (e.g. "app-a", "app-b",
+"app-c") — this tool has no opinion on what lanes exist.
+
+BREAKER SEMANTICS (deliberately manual-reset, not self-healing on one PASS):
+  - record-fail increments a per-lane fail_streak. At >= threshold
+    (default 2, LANE_BREAKER_THRESHOLD) the breaker TRIPS: tripped=true,
+    logged to delegation-alarms.log, and every subsequent `claim` on that
+    lane is REFUSED (exit 3) until an explicit `reset`.
+  - record-pass resets fail_streak to 0 but does NOT clear an existing trip
+    by itself — matching "a failed gate blocks ship even after the operator asked
+    for it" (feedback_three_gate_agents.md): one later pass is not itself
+    the hub reading the code, so it cannot be what silently reopens the
+    lane. Only `reset` (naming who and why) clears a trip.
+
+DESIGN DECISIONS from the 2026-09-27 bug-gate FAIL (report:
+hub/reports/2026-09-27-buggate-l0310.md) — fixed here, each with a new
+regression assertion in test-lane-lock.sh:
+
+  1. `--pid` is now REQUIRED on `claim` (chosen over "default to the PPID
+     chain's claude/node pid"). Reasoning: the bug was that an omitted
+     --pid silently recorded lane-lock's own transient CLI pid (already
+     dead the instant the command returns), so a second claim self-healed
+     a second later with zero refusal. Walking the parent-process chain to
+     find a claude/node ancestor is strictly MORE fragile, not less: it
+     needs a `ps`/proc-walk that can itself fail or find the wrong
+     ancestor (e.g. a caller invoked through a wrapper shell script whose
+     own parent is bash, not claude), and a wrong guess would be silently
+     wrong in the same way the bug already was. Required + a clear error
+     is mechanically simple, fails loud instead of guessing, and every
+     real caller (a build job, a hub worker) already knows its own pid.
+  2. A corrupt breaker.json now fails CLOSED: `read_breaker_failing_closed()`
+     treats any unparseable breaker.json as an already-TRIPPED breaker
+     (blocking claims) rather than the previous silent default of
+     tripped=False, and prints a WARNING plus appends one line to
+     delegation-alarms.log every time it happens. Corruption should never
+     be able to look identical to "healthy and untripped."
+  3. `_CritSection` now (a) detects a wrong-type path at the critsec lock
+     location (e.g. a plain file where a directory is expected) and fails
+     immediately with a clear `CritSectionError` instead of looping
+     forever trying `rmdir()` on a file, which always raises
+     `NotADirectoryError` — caught by the old bare `except OSError: pass`
+     — forever; and (b) after one steal attempt on a genuinely stale
+     directory lock, if the lock STILL cannot be acquired, raises instead
+     of retrying without bound. "Bounded wait" now means the call always
+     returns or raises within a bounded time, never hangs.
+  4. Pid liveness alone can't tell a live claim-holder from a different
+     process that later reused the same pid. `claim` now also records a
+     `start_key` (the holder's process start time, from `ps -o lstart=`)
+     at claim time; `pid_is_same_process()` compares BOTH liveness and
+     that start_key before treating a recorded holder as still the real
+     holder. A pid that's alive but whose start time no longer matches is
+     treated the same as a dead pid (self-heals). When no start_key was
+     ever captured (e.g. `ps` unavailable), this falls back to the old
+     liveness-only check rather than manufacturing a false refusal.
+     `force-release <lane> --by <name> --reason <text>` is the new,
+     explicit, always-available mechanical override for a lane stuck by
+     PID reuse (or anything else) — it logs who released it and why to
+     delegation-alarms.log, the same way `reset` logs breaker overrides.
+
+FURTHER FIXES from the 2026-09-27 RE-GATE r2 FAIL (report:
+hub/reports/2026-09-27-buggate-l0310-r2.md) — fix #4 above had two real
+gaps, closed here, each with a new regression assertion:
+
+  1. (blocker) `ps -o lstart=` is TZ- and locale-dependent: the SAME live,
+     unchanged process produces a different string under TZ=UTC than
+     under TZ=America/Chicago, so a claim and a later check running under
+     different env silently declared a genuinely alive holder dead and
+     stole its lane — reopening the exact 2026-09-21 double-build
+     collision this ticket exists to prevent, via a new vector. Fixed by
+     pinning TZ=UTC/LC_ALL=C/LANG=C via subprocess's own `env=` (never by
+     mutating this process's os.environ) on every `ps` call — both the
+     write path (claim, recording start_key) and the compare path
+     (pid_is_same_process recomputing it fresh) go through the one
+     proc_start_key() function, so there is only one place this could
+     drift. A fingerprint is now a tagged {"fmt": START_KEY_FMT, "value":
+     ...} dict, never a bare string, so an OLDER fingerprint (written
+     before this fix, under whatever TZ/LANG the caller happened to have)
+     is always distinguishable from a current one. A format mismatch is
+     NEVER treated as proof of death — pid_is_same_process() treats it as
+     UNKNOWN identity, assumes the holder is still alive, and logs an
+     alarm so the legacy fingerprint is visible and can be refreshed by a
+     re-claim, rather than risking either a false steal or silently
+     trusting a truly different process.
+  2. (blocker) A corrupt owner.json was NOT fail-closed — the exact same
+     defect class fixed for breaker.json (fix #2 above) but never
+     extended to the sibling file, and the more important of the two for
+     this tool's actual purpose (mutual exclusion). Fixed the same way:
+     `read_owner_failing_closed()` treats an unparseable owner.json as
+     held by an UNKNOWN owner (refusing claim AND release, pointing at
+     `force-release` as the recovery path) instead of the previous silent
+     default of "unheld." `force-release` deliberately does NOT go
+     through this fail-closed reader — it is the one command required to
+     work even when the file can't be parsed at all.
+  3. (nit) `--pid` must now be a positive integer; `--pid 0` or a
+     negative value is rejected with a clear error before any write,
+     instead of quietly claiming with zero real liveness protection.
+
+Usage:
+  lane-lock claim <lane> --owner <name> --pid <pid> [--reason <text>]
+  lane-lock release <lane> --owner <name>
+  lane-lock force-release <lane> --by <name> --reason <text>
+  lane-lock status <lane>
+  lane-lock list
+  lane-lock record-fail <lane> --ticket <id> --gate <bug-gate|playtest> [--detail <text>]
+  lane-lock record-pass <lane> --ticket <id> --gate <bug-gate|playtest>
+  lane-lock reset <lane> --by <name> --reason <text>
+
+Exit codes: 0 ok, 1 usage/internal error (including a missing/non-positive
+required --pid, or a critsec-lock timeout/wrong-type-path), 2 lane held by
+another live owner (including a corrupt-owner.json fail-closed, which
+looks the same to a caller as "held by someone" — see `force-release`), 3
+breaker tripped (claim refused, including a corrupt-breaker fail-closed).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = Path(os.environ.get("LANE_LOCK_ROOT") or (HOME / ".claude/hub/locks/lanes"))
+ALARMS_PATH = Path(os.environ.get("LANE_LOCK_ALARMS_LOG") or (HOME / ".claude/hub/delegation-alarms.log"))
+THRESHOLD = int(os.environ.get("LANE_BREAKER_THRESHOLD") or 2)
+LOCK_WAIT_S = float(os.environ.get("LANE_LOCK_WAIT_S") or 5.0)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def pid_alive(pid) -> bool:
+    """Liveness only: 'does *some* process currently have this pid.' Does
+    NOT check identity — a crashed holder's pid can be reused by an
+    unrelated process, which this function alone cannot detect. Callers
+    that need to know whether the ORIGINAL claim-holder is still alive
+    must use pid_is_same_process() instead (finding #4, 2026-09-27
+    bug-gate)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours — still alive
+    except OSError:
+        return False
+
+
+# Format tag for the identity fingerprint written by proc_start_key(). Bump
+# this if the fingerprint's shape or the `ps` invocation ever changes, so an
+# old fingerprint written under a different scheme is never compared
+# byte-for-byte against a new one (2026-09-27 re-gate r2, blocker #1: a
+# bare, unpinned `ps -o lstart=` string is TZ/LANG-dependent — a claim under
+# TZ=America/Chicago and a check under TZ=UTC produced two different
+# strings for the SAME live, unchanged process, which silently self-healed
+# a lane out from under its real holder).
+START_KEY_FMT = "lstart-C-UTC-v1"
+
+# Pin TZ/LC_ALL/LANG for every `ps` call this tool makes, on BOTH the write
+# path (claim, recording start_key) and the compare path (pid_is_same_process
+# recomputing it fresh) — both funnel through this one function, so there is
+# only one place this can drift. Passed via subprocess's own `env=`, scoped
+# to this one call, rather than mutating this process's os.environ (which
+# would leak into anything else this process later shells out to).
+_PINNED_PS_ENV_OVERRIDES = {"TZ": "UTC", "LC_ALL": "C", "LANG": "C"}
+
+
+def proc_start_key(pid) -> dict | None:
+    """Best-effort identity fingerprint for `pid`: its process start time
+    from `ps -o lstart=`, run under a pinned TZ/LC_ALL/LANG so the exact
+    same live process always yields the exact same string regardless of
+    the CALLING process's own environment. Two unrelated processes that
+    happen to reuse the same pid essentially never share the same start
+    time to the second, so (pid, start_key) is a much stronger identity
+    check than pid liveness alone. Returns a small tagged dict
+    {"fmt": START_KEY_FMT, "value": <ps output>} — never a bare string —
+    so a fingerprint written by this exact scheme is always
+    distinguishable from one written by any other (older or future)
+    scheme. Returns None when the pid can't be found or `ps` can't be
+    run — callers must treat None as 'cannot verify', never as a match or
+    a mismatch."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    env = {**os.environ, **_PINNED_PS_ENV_OVERRIDES}
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    value = out.stdout.strip()
+    if not value:
+        return None
+    return {"fmt": START_KEY_FMT, "value": value}
+
+
+def _is_recognized_start_key(x) -> bool:
+    """True only for a fingerprint in the CURRENT tagged format. A bare
+    string (the pre-fix format, TZ/LANG-dependent) or any dict tagged with
+    a different/unknown fmt both return False — callers must treat that
+    as 'cannot verify', never as a mismatch, so a legacy or foreign-format
+    record is never mistaken for proof that the holder died."""
+    return (
+        isinstance(x, dict)
+        and x.get("fmt") == START_KEY_FMT
+        and isinstance(x.get("value"), str)
+        and bool(x.get("value"))
+    )
+
+
+def pid_is_same_process(pid, expected_start_key) -> bool:
+    """True only when `pid` is alive AND (when we have a start_key to
+    check against, in the current recognized format) its current start
+    time still matches the one recorded at claim time. A pid that is
+    alive but whose start time has changed is a different process wearing
+    the old holder's pid — treated the same as dead (self-heals).
+
+    With NO expected_start_key on record (an older claim from before this
+    field existed, or `ps` was unavailable at claim time), falls back to
+    liveness-only, same as always.
+
+    With an expected_start_key that exists but is NOT in the current
+    recognized format (2026-09-27 re-gate r2, blocker #1: e.g. a bare
+    string written by the pre-TZ-pinning code) — this must NEVER be
+    treated as a mismatch (that would silently declare a genuinely alive,
+    unchanged holder dead purely because of a format/env difference, the
+    exact defect just fixed). It is treated as UNKNOWN identity: assume
+    still alive, and log an alarm so the legacy fingerprint is visible
+    and can be refreshed by a re-claim, rather than fail either
+    permissively-wrong or restrictively-wrong."""
+    if not pid_alive(pid):
+        return False
+    if not expected_start_key:
+        return True
+    if not _is_recognized_start_key(expected_start_key):
+        append_alarm(
+            f"pid {pid}: recorded start_key is in an unrecognized or "
+            f"legacy format (not {START_KEY_FMT!r}) — treating identity "
+            f"as UNKNOWN and assuming the holder is still alive rather "
+            f"than risking a false self-heal. Re-claim this lane once "
+            f"it's safe to refresh the fingerprint to the current format."
+        )
+        return True
+    current = proc_start_key(pid)
+    if current is None or not _is_recognized_start_key(current):
+        return True
+    return current == expected_start_key
+
+
+class CritSectionError(RuntimeError):
+    """Raised by _CritSection when it cannot acquire the lock within its
+    bounded wait, or when the lock path is not the directory this tool
+    itself creates (finding #3, 2026-09-27 bug-gate). Caught by main()'s
+    generic handler, printed clearly, exit 1 — never a silent hang."""
+
+
+class _CritSection:
+    """Short-lived mkdir-based lock around one lane's read-modify-write, so
+    two concurrent `lane-lock claim`/`record-fail` calls on the same lane
+    never interleave. NOT held for a build's duration — that is
+    ws-build-slot's job. Same mkdir-atomicity idea as ws-build-slot, scaled
+    down to a single critical section.
+
+    Bounded wait, no exceptions: the old version, on a stuck lock, retried
+    `rmdir()` forever with a bare `except OSError: pass`. If the lock path
+    was a plain FILE (not the directory this tool creates — an external
+    write, a backup restore, a tooling mistake), `rmdir()` always raises
+    NotADirectoryError, which that bare except swallowed, so the loop spun
+    forever with no error, no timeout, no visible symptom besides the
+    caller hanging. This version (a) recognizes a wrong-type path
+    immediately and fails loud instead of trying to fix it automatically,
+    and (b) after exactly one steal attempt on a genuinely stale
+    directory lock, raises instead of retrying without limit."""
+
+    def __init__(self, lane_dir: Path):
+        self.lockdir = lane_dir / ".critsec.lock"
+
+    def __enter__(self):
+        deadline = time.time() + LOCK_WAIT_S
+        stole_once = False
+        while True:
+            try:
+                self.lockdir.mkdir(parents=True, exist_ok=False)
+                return self
+            except FileExistsError:
+                if self.lockdir.exists() and not self.lockdir.is_dir():
+                    # Wrong-type path: never auto-delete an unknown file at
+                    # a lock location. rmdir() on this always raises
+                    # NotADirectoryError, so looping here never converges —
+                    # fail immediately and say exactly why.
+                    raise CritSectionError(
+                        f"lane-lock critsec path {self.lockdir} exists but "
+                        f"is not a directory (wrong-type path — an "
+                        f"external write or tooling mistake, not this "
+                        f"tool). Refusing to touch it automatically; "
+                        f"inspect and remove it by hand, then retry."
+                    )
+                if time.time() > deadline:
+                    if stole_once:
+                        # Already stole once this call and still can't get
+                        # the lock — bounded wait means bounded, full
+                        # stop, never a second unbounded retry loop.
+                        raise CritSectionError(
+                            f"lane-lock critsec lock {self.lockdir} did "
+                            f"not clear after {LOCK_WAIT_S}s + one steal "
+                            f"attempt — timing out instead of hanging. "
+                            f"Retry, or inspect {self.lockdir} by hand."
+                        )
+                    try:
+                        self.lockdir.rmdir()
+                        stole_once = True
+                    except OSError as e:
+                        raise CritSectionError(
+                            f"lane-lock critsec lock {self.lockdir} timed "
+                            f"out after {LOCK_WAIT_S}s and could not be "
+                            f"cleared ({type(e).__name__}: {e}) — exiting "
+                            f"instead of hanging."
+                        ) from e
+                    continue
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            self.lockdir.rmdir()
+        except OSError:
+            pass
+
+
+def lane_dir(lane: str) -> Path:
+    d = ROOT / lane
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def read_json(path: Path, default: dict) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(default)
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def append_alarm(line: str) -> None:
+    try:
+        ALARMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(ALARMS_PATH, "a") as f:
+            f.write(f"{now_iso()} [lane-lock] {line}\n")
+    except OSError:
+        pass  # alarm logging must never crash the caller
+
+
+def owner_path(d: Path) -> Path:
+    return d / "owner.json"
+
+
+def breaker_path(d: Path) -> Path:
+    return d / "breaker.json"
+
+
+DEFAULT_BREAKER = {
+    "fail_streak": 0,
+    "tripped": False,
+    "tripped_at": None,
+    "history": [],  # last N {ts, ticket, gate, result, detail}
+}
+
+
+def read_breaker_failing_closed(d: Path) -> tuple[dict, bool]:
+    """Read breaker.json for lane-dir `d`. Unlike read_json()'s generic
+    "any parse failure returns the caller's default," a corrupt
+    breaker.json must NEVER be indistinguishable from a healthy, untripped
+    breaker (finding #2, 2026-09-27 bug-gate: that silent equivalence is
+    exactly what let a corrupted file un-trip a breaker the hub had
+    deliberately tripped). A missing file (never yet written) is still a
+    normal, healthy default — only a file that EXISTS but fails to parse
+    is treated as a safety event: fails CLOSED (as if already tripped),
+    prints a loud warning, and appends one alarm line. Returns
+    (breaker_dict, was_corrupt)."""
+    path = breaker_path(d)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return dict(DEFAULT_BREAKER), False
+    try:
+        return json.loads(text), False
+    except json.JSONDecodeError as e:
+        corrupt = {
+            "fail_streak": DEFAULT_BREAKER["fail_streak"],
+            "tripped": True,
+            "tripped_at": now_iso(),
+            "history": [],
+        }
+        msg = (
+            f"lane={d.name} breaker.json is CORRUPT ({type(e).__name__}: "
+            f"{e}) — failing CLOSED (treating the lane as TRIPPED) until "
+            f"a human inspects and fixes or explicitly `reset`s it. This "
+            f"is a safety fail-closed, never a self-heal."
+        )
+        print(f"WARNING: {msg}", file=sys.stderr)
+        append_alarm(msg)
+        return corrupt, True
+
+
+def read_owner_failing_closed(d: Path) -> tuple[dict, bool]:
+    """Read owner.json for lane-dir `d`. Mirrors read_breaker_failing_closed
+    exactly, for the sibling file (2026-09-27 re-gate r2, blocker #2): a
+    MISSING file (never claimed) is a normal, healthy 'unheld' state
+    (returns ({}, False)). A file that EXISTS but fails to parse must
+    NEVER be silently treated as 'unheld' — that is precisely how a
+    corrupted ownership record would defeat this tool's entire purpose
+    (mutual exclusion), the same defect class already fixed for
+    breaker.json. Fails CLOSED instead: returns a sentinel
+    {"_corrupt": True} and True, prints a loud warning, and appends one
+    alarm line, every time it's detected. `force-release` is the only
+    command that must NOT go through this — it's the designated recovery
+    path and has to work even when the file can't be parsed at all."""
+    path = owner_path(d)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}, False
+    try:
+        return json.loads(text), False
+    except json.JSONDecodeError as e:
+        msg = (
+            f"lane={d.name} owner.json is CORRUPT ({type(e).__name__}: "
+            f"{e}) — failing CLOSED (treating the lane as held by an "
+            f"UNKNOWN owner, refusing claims/release) until a human "
+            f"inspects it or runs `lane-lock force-release {d.name} --by "
+            f"<name> --reason <text>` to mechanically clear it. This is a "
+            f"safety fail-closed, never a self-heal."
+        )
+        print(f"WARNING: {msg}", file=sys.stderr)
+        append_alarm(msg)
+        return {"_corrupt": True}, True
+
+
+def cmd_claim(args) -> int:
+    if args.pid is None:
+        print(
+            "lane-lock error: --pid is required for `claim`. Pass the pid "
+            "of the actual long-lived caller (e.g. --pid $$ for the "
+            "calling shell/session, or a build job's own pid) — never "
+            "omit it. Omitting --pid used to silently record this "
+            "short-lived CLI's OWN pid, which is already dead by the time "
+            "the command returns, letting a second caller claim the same "
+            "lane moments later with zero refusal (finding #1, 2026-09-27 "
+            "bug-gate).",
+            file=sys.stderr,
+        )
+        return 1
+    if args.pid <= 0:
+        print(
+            f"lane-lock error: --pid must be a positive integer (got "
+            f"{args.pid}) — pass the real pid of the long-lived caller, "
+            f"never a sentinel or placeholder value.",
+            file=sys.stderr,
+        )
+        return 1
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        breaker, breaker_corrupt = read_breaker_failing_closed(d)
+        if breaker.get("tripped"):
+            corrupt_note = (
+                " NOTE: breaker.json was found CORRUPT on this read and is "
+                "being treated as tripped (fail-closed) — inspect the "
+                "file, fix or accept the reset, and only then `reset` "
+                "once real lane health is confirmed."
+                if breaker_corrupt
+                else ""
+            )
+            print(
+                f"REFUSED lane={args.lane}: breaker TRIPPED at "
+                f"{breaker.get('tripped_at')} (fail_streak reached "
+                f"{breaker.get('fail_streak')}) — run `lane-lock reset "
+                f"{args.lane} --by <name> --reason <text>` after the hub "
+                f"has actually looked at the diff, not before.{corrupt_note}"
+            )
+            return 3
+
+        op, owner_corrupt = read_owner_failing_closed(d)
+        if owner_corrupt:
+            print(
+                f"REFUSED lane={args.lane}: owner.json is CORRUPT — held "
+                f"by an UNKNOWN owner until a human resolves it. Run "
+                f"`lane-lock force-release {args.lane} --by <name> "
+                f"--reason <text>` to mechanically clear it, then claim "
+                f"again."
+            )
+            return 2
+        holder_is_live = bool(op) and pid_is_same_process(
+            op.get("pid"), op.get("start_key")
+        )
+        held_by_other_live = (
+            op and op.get("owner") != args.owner and holder_is_live
+        )
+        if held_by_other_live:
+            print(
+                f"REFUSED lane={args.lane}: held by '{op.get('owner')}' "
+                f"(pid {op.get('pid')}, claimed {op.get('claimed_at')}, "
+                f"reason: {op.get('reason', '')!r}) — still alive"
+            )
+            return 2
+
+        # Either unheld, held by us already, or held by a dead/replaced
+        # pid (self-heal).
+        record = {
+            "lane": args.lane,
+            "owner": args.owner,
+            "pid": args.pid,
+            "start_key": proc_start_key(args.pid),
+            "session": args.session or "",
+            "claimed_at": now_iso(),
+            "reason": args.reason or "",
+        }
+        write_json_atomic(owner_path(d), record)
+        healed = (
+            " (previous holder's pid was dead or reused by a different "
+            "process — self-healed)"
+            if op and not holder_is_live and op.get("owner") != args.owner
+            else ""
+        )
+        print(f"CLAIMED lane={args.lane} owner={args.owner} pid={record['pid']}{healed}")
+        return 0
+
+
+def cmd_release(args) -> int:
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        op, owner_corrupt = read_owner_failing_closed(d)
+        if owner_corrupt:
+            print(
+                f"REFUSED release lane={args.lane}: owner.json is CORRUPT "
+                f"— cannot verify you are the recorded owner. Run "
+                f"`lane-lock force-release {args.lane} --by <name> "
+                f"--reason <text>` instead."
+            )
+            return 2
+        if not op:
+            print(f"OK lane={args.lane}: already unheld")
+            return 0
+        if op.get("owner") != args.owner:
+            print(
+                f"REFUSED release lane={args.lane}: current owner is "
+                f"'{op.get('owner')}', not '{args.owner}' — a peer can "
+                f"never release another owner's claim, self-release only "
+                f"(use `force-release` if the recorded owner can never "
+                f"come back to release it itself)"
+            )
+            return 2
+        owner_path(d).unlink(missing_ok=True)
+        print(f"RELEASED lane={args.lane} by owner={args.owner}")
+        return 0
+
+
+def cmd_force_release(args) -> int:
+    """Mechanical override for a lane stuck by pid reuse (finding #4,
+    2026-09-27 bug-gate), a corrupt owner.json (blocker #2, 2026-09-27
+    re-gate r2), or any other reason a normal `release` can't reach (the
+    owner's process/session is gone and can never self-release, or the
+    record can't even be parsed to find out who it was). Deliberately
+    does NOT go through read_owner_failing_closed() — this command's
+    entire job is to work even when the file is unreadable. Always logs
+    who released it and why, the same way `reset` logs breaker
+    overrides — never a silent unlock."""
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        try:
+            op = json.loads(owner_path(d).read_text())
+            unreadable = False
+        except FileNotFoundError:
+            op = {}
+            unreadable = False
+        except json.JSONDecodeError:
+            op = {}
+            unreadable = True
+        if not op and not unreadable:
+            print(f"OK lane={args.lane}: already unheld (force-release was a no-op)")
+            return 0
+        prior_owner = op.get("owner", "(unknown)") if not unreadable else "(unknown — owner.json was corrupt)"
+        prior_pid = op.get("pid", "(unknown)") if not unreadable else "(unknown)"
+        owner_path(d).unlink(missing_ok=True)
+    line = (
+        f"lane={args.lane} FORCE-RELEASED by {args.by}: was held by "
+        f"'{prior_owner}' (pid {prior_pid}) — reason: {args.reason!r}"
+    )
+    print(f"OK {line}")
+    append_alarm(line)
+    return 0
+
+
+def cmd_status(args) -> int:
+    d = lane_dir(args.lane)
+    op, owner_corrupt = read_owner_failing_closed(d)
+    breaker, breaker_corrupt = read_breaker_failing_closed(d)
+    if owner_corrupt:
+        print(
+            f"lane={args.lane} owner=UNKNOWN (owner.json is CORRUPT — "
+            f"failing closed, refusing claims/release; run `force-release "
+            f"{args.lane} --by <name> --reason <text>` to clear it)"
+        )
+    elif op:
+        same = pid_is_same_process(op.get("pid"), op.get("start_key"))
+        if same:
+            state = "alive"
+        elif pid_alive(op.get("pid")):
+            state = "DEAD (pid reused by a different process — will self-heal on next claim)"
+        else:
+            state = "DEAD (will self-heal on next claim)"
+        print(
+            f"lane={args.lane} owner={op.get('owner')} pid={op.get('pid')} "
+            f"({state}) claimed_at={op.get('claimed_at')} reason={op.get('reason', '')!r}"
+        )
+    else:
+        print(f"lane={args.lane} owner=(none, unheld)")
+    if breaker.get("tripped"):
+        corrupt_note = " (breaker.json was CORRUPT — failing closed)" if breaker_corrupt else ""
+        print(
+            f"lane={args.lane} breaker=TRIPPED at {breaker.get('tripped_at')} "
+            f"fail_streak={breaker.get('fail_streak')}{corrupt_note}"
+        )
+    else:
+        print(f"lane={args.lane} breaker=closed fail_streak={breaker.get('fail_streak', 0)}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    if not ROOT.exists():
+        print("(no lanes yet)")
+        return 0
+    for d in sorted(ROOT.iterdir()):
+        if not d.is_dir():
+            continue
+        args2 = argparse.Namespace(lane=d.name)
+        cmd_status(args2)
+    return 0
+
+
+def _record_history(breaker: dict, ticket: str, gate: str, result: str, detail: str) -> None:
+    breaker.setdefault("history", [])
+    breaker["history"].append(
+        {"ts": now_iso(), "ticket": ticket, "gate": gate, "result": result, "detail": detail}
+    )
+    breaker["history"] = breaker["history"][-20:]  # bounded, never grows unbounded
+
+
+def cmd_record_fail(args) -> int:
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        breaker, _corrupt = read_breaker_failing_closed(d)
+        breaker["fail_streak"] = int(breaker.get("fail_streak", 0)) + 1
+        _record_history(breaker, args.ticket, args.gate, "FAIL", args.detail or "")
+        just_tripped = False
+        if breaker["fail_streak"] >= THRESHOLD and not breaker.get("tripped"):
+            breaker["tripped"] = True
+            breaker["tripped_at"] = now_iso()
+            just_tripped = True
+        write_json_atomic(breaker_path(d), breaker)
+
+    if just_tripped:
+        msg = (
+            f"lane={args.lane} BREAKER TRIPPED: {breaker['fail_streak']} "
+            f"consecutive {args.gate} FAILs (ticket={args.ticket}, latest "
+            f"detail={args.detail!r}) — further `lane-lock claim` on this "
+            f"lane is refused until an explicit reset"
+        )
+        print(f"TRIPPED {msg}")
+        append_alarm(msg)
+        return 3
+    print(
+        f"OK lane={args.lane}: recorded FAIL #{breaker['fail_streak']} "
+        f"(threshold {THRESHOLD}) for {args.gate} on ticket {args.ticket}"
+    )
+    return 0
+
+
+def cmd_record_pass(args) -> int:
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        breaker, _corrupt = read_breaker_failing_closed(d)
+        breaker["fail_streak"] = 0
+        _record_history(breaker, args.ticket, args.gate, "PASS", args.detail or "")
+        write_json_atomic(breaker_path(d), breaker)
+    still_tripped = breaker.get("tripped")
+    print(
+        f"OK lane={args.lane}: fail_streak reset to 0 for {args.gate} on "
+        f"ticket {args.ticket}"
+        + (" — breaker still TRIPPED, needs an explicit `reset`" if still_tripped else "")
+    )
+    return 0
+
+
+def cmd_reset(args) -> int:
+    d = lane_dir(args.lane)
+    with _CritSection(d):
+        breaker, _corrupt = read_breaker_failing_closed(d)
+        was_tripped = breaker.get("tripped")
+        breaker["tripped"] = False
+        breaker["tripped_at"] = None
+        breaker["fail_streak"] = 0
+        breaker.setdefault("history", []).append(
+            {"ts": now_iso(), "ticket": "", "gate": "reset", "result": f"RESET by {args.by}", "detail": args.reason or ""}
+        )
+        write_json_atomic(breaker_path(d), breaker)
+    if was_tripped:
+        line = f"lane={args.lane} breaker RESET by {args.by}: {args.reason!r}"
+        print(f"OK {line}")
+        append_alarm(line)
+    else:
+        print(f"OK lane={args.lane}: breaker was not tripped, fail_streak cleared anyway")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="lane-lock")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("claim")
+    p.add_argument("lane")
+    p.add_argument("--owner", required=True)
+    # NOT argparse `required=True`: that would exit via SystemExit(2),
+    # colliding with this tool's own exit-code-2 meaning ("held by another
+    # live owner"). default=None + the explicit check at the top of
+    # cmd_claim gives a clear message AND exit 1 ("usage/internal error"),
+    # never silently defaulting to this CLI's own dying pid (finding #1).
+    p.add_argument("--pid", type=int, default=None)
+    p.add_argument("--session", default="")
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("release")
+    p.add_argument("lane")
+    p.add_argument("--owner", required=True)
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("force-release")
+    p.add_argument("lane")
+    p.add_argument("--by", required=True)
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_force_release)
+
+    p = sub.add_parser("status")
+    p.add_argument("lane")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("record-fail")
+    p.add_argument("lane")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--gate", required=True, choices=["bug-gate", "playtest", "other"])
+    p.add_argument("--detail", default="")
+    p.set_defaults(func=cmd_record_fail)
+
+    p = sub.add_parser("record-pass")
+    p.add_argument("lane")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--gate", required=True, choices=["bug-gate", "playtest", "other"])
+    p.add_argument("--detail", default="")
+    p.set_defaults(func=cmd_record_pass)
+
+    p = sub.add_parser("reset")
+    p.add_argument("lane")
+    p.add_argument("--by", required=True)
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_reset)
+
+    args = ap.parse_args()
+    try:
+        return args.func(args)
+    except Exception as e:  # never crash unlabeled — always say what broke
+        print(f"lane-lock error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

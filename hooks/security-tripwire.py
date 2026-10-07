@@ -100,8 +100,12 @@ def tracked_secrets():
     # Same word list as safety-guard.py's strict rule, and for the same reason:
     # bare "pass" is a noun in prose (a review pass, a QA pass) and is usually
     # followed by a date, which the entropy test below would misread as a secret.
+    # Keyword may sit inside a longer or quoted name (DB_PASSWORD, "client_secret":, clientSecret); L-1615.
+    # Same rule as hooks/git-pre-commit-secret-scan.py CRED_ASSIGN.
     cred = re.compile(
-        r"(?i)\b(passcode|password|passphrase|passwd|secret|token|api[_-]?key)\b"
+        r"(?i)(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*?"
+        r"(?:passcode|password|passphrase|passwd|secret|token|api[_-]?key|apikey|private[_-]?key)"
+        r"(?:s|[_-]?(?:key|value|val|str|string))?[\"']?"
         r"[\s:=(`\"']{1,4}([A-Za-z0-9][A-Za-z0-9._-]{9,60})")
     # Env lookups and template vars are the CORRECT pattern — they are what a
     # remediated file looks like, so flagging them would train the reader to
@@ -112,10 +116,23 @@ def tracked_secrets():
     not_a_secret = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|v?\d+\.\d+[\w.-]*)$")
     # An ALL_CAPS identifier after "token" is an env-var NAME (<product-b>_D1_TOKEN), not a value
     # (L-0848). Dashed all-caps words are skipped only digit-free, so ABCD-1234-... still fires.
-    identifier = re.compile(r"^(?:[A-Z][A-Z0-9_]+|[A-Z][A-Z-]+)$")
+    identifier = re.compile(r"^(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*|[A-Z][A-Z-]+)$")
+    # L-1615 fix2 (B1): reports, QA scripts and tests quote fabricated secret-SHAPED values by
+    # design (fake Bearer tokens, canary env vars, all-zero edit tokens). Flagging them made the
+    # tripwire red at every session start with "rotate, then purge" on nothing real, which trains
+    # the reader to ignore it. New commits are still gated by the pre-commit scanner.
+    fixture_path = re.compile(
+        r"^(?:hub/reports/|hub/bug-gate/|hub/playtests/|tools/shotter/)"
+        r"|(?:^|/)(?:tests?|__tests__|fixtures?)/"
+        r"|(?:^|/)(?:test[_-][^/]*|[^/]*[_.-]tests?\.[a-z]+)$")
+    # Values that announce themselves as masked / canary / fake, or are all zeros.
+    fake_value = re.compile(r"(?i)(?:fake|canary|dummy|masked|redacted|placeholder|notreal|0{6,})")
+    allow_marker = re.compile(r"secret-scan:\s*allow\b")
     hits = []
     for rel in out:
         if not rel or not rel.endswith((".md", ".json", ".sh", ".py", ".mjs")):
+            continue
+        if fixture_path.search(rel):
             continue
         # The guard's own test suite contains fabricated secret-SHAPED fixtures
         # by design — same single-path exemption safety-guard.py carries.
@@ -127,8 +144,17 @@ def tracked_secrets():
         except OSError:
             continue
         for m in cred.finditer(text):
-            val = m.group(2)
+            val = m.group(1)
             if placeholder.match(val) or not_a_secret.match(val) or identifier.match(val):
+                continue
+            if fake_value.search(val):
+                continue
+            # A value directly followed by an open paren is a function call, not a literal.
+            if text[m.end(1):m.end(1) + 1] == "(":
+                continue
+            ls = text.rfind("\n", 0, m.start()) + 1
+            le = text.find("\n", m.end())
+            if allow_marker.search(text[ls:le if le != -1 else len(text)]):
                 continue
             if any(c.isdigit() for c in val) or (val.count("-") + val.count("_")) >= 2:
                 hits.append(rel)

@@ -15,7 +15,7 @@ Steps:
    - *Vite path:* scaffold a React-TS Vite app. Wire Tailwind v4 the convention way — `@tailwindcss/vite` plugin in `vite.config.ts`, **no `tailwind.config.js`**; design tokens live in `src/index.css` under `@theme`. Add a `.panel`-style starter class so the design system has a home.
    - *Next path:* `npx create-next-app@latest <name> --typescript --tailwind --app`. Then read `node_modules/next/dist/docs/` before writing any app code — **Next 16 has breaking changes vs. training data** (this is the `@AGENTS.md` rule the other Next projects share). Copy that nextjs-agent-rules block into the project's `AGENTS.md` and point `CLAUDE.md` at it via `@AGENTS.md`.
 3. **CLAUDE.md codebase map.** Generate one at the project root following the `/index` convention (Overview / Tech stack / File map / Architecture / Entry points / Conventions). Keep it scannable — it's the file future sessions read instead of re-exploring.
-4. **Cloudflare Pages deploy.** Add the standard npm scripts (mirror our-place):
+4. **Cloudflare Pages deploy.** Add the standard npm scripts (mirror my-app):
    ```
    "deploy:preview": "npm run build && wrangler pages deploy dist --project-name <name> --branch preview",
    "deploy:prod":    "npm run build && wrangler pages deploy dist --project-name <name> --branch main"

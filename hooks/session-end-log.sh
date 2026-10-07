@@ -145,16 +145,48 @@ else
   # --trigger sessionend). A clean, minimal payload -- {session_id, transcript_path}
   # using the SAME sid this script already trusts (not the raw hook payload's own
   # session_id field, to stay consistent with the lineage-id handling above).
-  # Detached so it outlives this hook's own process.
+  #
+  # L-1079: this used to background pre-compact-real-log.sh with plain
+  # `nohup ... & disown`. nohup only blocks SIGHUP -- it does nothing against
+  # a `kill -9 -$PGID` aimed at the whole process group, which is exactly
+  # what L-0953 proved the harness does to an async hook, and a SessionEnd
+  # hook is even more exposed (the ENTIRE CLI process is exiting, not just
+  # moving to a next step). That backgrounded subshell was still a member of
+  # this script's own process group, so it died before pre-compact-real-
+  # log.sh ever got far enough to spawn its own (properly setsid()'d)
+  # worker -- the exact L-0953 bug, recurring one layer up. Measured
+  # effect: 205 MISS receipts in hub/autolog.log, only 2 closeout-*.md ever
+  # produced (~1%).
+  #
+  # Fix: call pre-compact-real-log-worker.sh directly through the SAME
+  # detach_launcher.py (setsid()) primitive pre-compact-real-log.sh already
+  # uses for itself, so the process-group hop happens immediately -- before
+  # this hook's own process has any chance to return and get its group
+  # reclaimed. The payload goes in as a FILE argument, not stdin:
+  # detach_launcher.py always feeds its child /dev/null on stdin (by
+  # design, so nothing downstream ever blocks on a pipe that outlived its
+  # writer), so stdin was never going to reach the worker through this path
+  # anyway.
   PAYLOAD_FILE=$(mktemp)
   python3 -c "import json,sys; print(json.dumps({'session_id': sys.argv[1], 'transcript_path': sys.argv[2]}))" "$sid" "$tp" > "$PAYLOAD_FILE" 2>/dev/null
   if [ -s "$PAYLOAD_FILE" ]; then
-    (
-      nohup "$HOME/.claude/hooks/pre-compact-real-log.sh" --trigger sessionend < "$PAYLOAD_FILE" \
-        >>"$HOME/.claude/hub/hook-errors.log" 2>&1
-      rm -f "$PAYLOAD_FILE"
-    ) &
-    disown 2>/dev/null || true
+    RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/precompact-reallog.XXXXXX" 2>/dev/null)
+    if [ -n "$RUNDIR" ] && cp "$PAYLOAD_FILE" "$RUNDIR/input.json" 2>/dev/null; then
+      if python3 "$HOME/.claude/hooks/lib/detach_launcher.py" \
+            --log "$HOME/.claude/hub/hook-errors.log" -- \
+            bash "$HOME/.claude/hooks/pre-compact-real-log-worker.sh" \
+              --input-file "$RUNDIR/input.json" --trigger sessionend --rundir "$RUNDIR" \
+            >/dev/null 2>&1
+      then
+        rm -f "$PAYLOAD_FILE"
+      else
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) L-1079 sessionend-backfill dispatcher could not launch detached worker" >> "$HOME/.claude/hub/delegation-alarms.log"
+        rm -rf "$RUNDIR" "$PAYLOAD_FILE" 2>/dev/null
+      fi
+    else
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) L-1079 sessionend-backfill could not create a run dir — aborting, no file written" >> "$HOME/.claude/hub/delegation-alarms.log"
+      rm -rf "$RUNDIR" "$PAYLOAD_FILE" 2>/dev/null
+    fi
   else
     rm -f "$PAYLOAD_FILE"
   fi

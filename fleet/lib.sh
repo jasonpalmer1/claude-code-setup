@@ -52,6 +52,70 @@ fleet_lock_path() {  # <abs-dir> -> prints the lock file path
   printf '%s/%s.lock\n' "$FLEET_LOCKS_DIR" "$hash"
 }
 
+# fleet_is_hub_caller — true (rc 0) iff THIS process, or one of its ancestors
+# (bounded walk), is the pid currently holding the single-hub lease
+# (~/.claude/hub/HUB-LEASE.json, L-0911). Used to exempt hub-originated
+# spawns from the peer-recursion depth guard below.
+#
+# 2026-09-27 (L-1229): the hub session is itself normally launched VIA the
+# fleet (reference_fleet_spawn.md's respawn protocol) -- so the hub's own
+# `claude` process inherits CLAUDE_FLEET_DEPTH=1 from that launch, same as
+# any other peer. Every `spawn` call made from inside the hub session (its
+# main loop's Bash tool, or an Agent-tool subagent it runs) is therefore a
+# CHILD PROCESS of that same pid and computes new_depth=2, so
+# fleet_check_depth refuses it as "a peer spawning a peer" -- even though
+# OPERATOR.md makes the hub the one sanctioned root dispatcher that must be
+# able to spawn freely (L-1229: "so hub can freely open/close them").
+# Reproduced live: a Bash subprocess under the hub session (ppid = the
+# hub's own lease pid) hit exactly this refusal calling `spawn` directly.
+#
+# A genuine peer-of-peer chain is NOT affected: a session opened by `spawn`
+# runs in Terminal.app's own process tree, not as a descendant of the hub's
+# `claude` process, so its ancestry walk never reaches the hub's pid and the
+# depth guard still applies to it normally.
+#
+# Fails toward "not the hub" (1) on any missing/stale/unparseable lease --
+# never grants the exemption on doubt; a false negative just means the
+# existing --force-depth escape hatch is still needed, same as today.
+fleet_is_hub_caller() {
+  local lease="$HOME/.claude/hub/HUB-LEASE.json"
+  [ -f "$lease" ] || return 1
+  local hub_pid
+  hub_pid="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$lease" | head -1)"
+  [[ "$hub_pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$hub_pid" 2>/dev/null || return 1   # lease pid must be alive right now
+
+  # 2026-09-27 (L-1229 bug-gate blocker fix): kill -0 alone only proves SOME
+  # process currently owns pid $hub_pid right now, not that it's the SAME
+  # process the lease recorded -- pid numbers get recycled, and this exact
+  # codebase already treats bare kill -0 as insufficient in two other
+  # places for exactly that reason (fleet_lock_alive's pid_start
+  # cross-check just below, and hub_lease_lib.py's own three-signal
+  # verdict()). Reuse hub_lease_lib.py's "Signal 2" here rather than a
+  # third bespoke implementation: cross-check the lease's own session_id
+  # against ~/.claude/sessions/<hub_pid>.json's sessionId field. A pid
+  # that was recycled to an unrelated process has no session record at
+  # all, or one for a different session_id, either way this fails CLOSED
+  # (not the hub) -- same fail-toward-"not the hub" posture as every
+  # other check in this function.
+  local lease_sid session_file session_sid
+  lease_sid="$(sed -n 's/.*"session_id": *"\([^"]*\)".*/\1/p' "$lease" | head -1)"
+  [ -n "$lease_sid" ] || return 1
+  session_file="$HOME/.claude/sessions/${hub_pid}.json"
+  [ -f "$session_file" ] || return 1
+  session_sid="$(sed -n 's/.*"sessionId": *"\([^"]*\)".*/\1/p' "$session_file" | head -1)"
+  [ -n "$session_sid" ] && [ "$session_sid" = "$lease_sid" ] || return 1
+
+  local pid=$$ hops=0
+  while [ "$pid" -gt 1 ] && [ "$hops" -lt 25 ]; do
+    [ "$pid" = "$hub_pid" ] && return 0
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
 # Depth cap — refuse to create a job at depth >= 2 unless forced.
 # Args: caller_depth force(0/1). On success prints the NEW job's depth to
 # stdout and returns 0. On refusal prints the reason to stderr and returns 1.
@@ -265,6 +329,17 @@ fleet_resolve_worktree() {
   fi
 
   local wt_root="${toplevel}-wt"
+  # L-1682 (the operator 2026-10-05, tappable yes): <product-a> lane worktrees default to the
+  # UnionSine USB (jp-build/ws-wt), not the root disk. jp-build-root falls back to the old
+  # path with a loud log line when the drive is not mounted. Other repos are unchanged.
+  # Existing lanes at the old root are reused where they are (never moved) -- see below.
+  local old_wt_root="$wt_root"
+  case "$(basename "$toplevel")" in
+    <product-a>)
+      local jp_ws_wt
+      jp_ws_wt="$("${JP_BUILD_ROOT_BIN:-$HOME/.claude/hub/bin/jp-build-root}" ws-wt)" && [ -n "$jp_ws_wt" ] && wt_root="$jp_ws_wt"
+      ;;
+  esac
   local wt_dir="${wt_root}/${name}"
   local branch="lane/${name}"
   mkdir -p "$wt_root"
@@ -277,6 +352,11 @@ fleet_resolve_worktree() {
     | awk -v b="refs/heads/$branch" '/^worktree /{p=$2} /^branch /{if ($2==b) print p}')"
 
   if [ -n "$existing_path" ]; then
+    if [ "$existing_path" = "${old_wt_root}/${name}" ]; then
+      # pre-L-1682 lane still at the root-disk path: reuse in place, never move it.
+      echo "$existing_path"
+      return 0
+    fi
     if [ "$existing_path" != "$wt_dir" ]; then
       # Branch lane/<name> is checked out somewhere OTHER than the expected
       # <repo>-wt/<name> -- a collision git itself would refuse anyway ("branch
@@ -316,5 +396,37 @@ fleet_resolve_worktree() {
   fi
 
   echo "$wt_dir"
+  return 0
+}
+
+# L-1559 item 2: lanes run Sonnet; Opus/Fable only for the Hub or with an explicit, logged reason.
+# fleet_check_model <name> <model> <top_tier_reason> <inherit_model 0|1>
+# Refuses (return 1, message on stderr) when the session would run on opus/fable and neither the name
+# is "Hub" nor a --top-tier reason was given. Appends allowed exceptions to hub/model-escalations.log
+# (override: FLEET_ESCALATION_LOG). A bare --inherit-model resolves to settings.json's model
+# (override: FLEET_SETTINGS) and is judged the same way. Case-insensitive; matches any id containing
+# "opus" or "fable" (opus, Opus, claude-opus-5-5, fable, ...).
+fleet_check_model() {
+  local name="$1" model="$2" reason="$3" inherit="${4:-0}" eff lc lname log
+  eff="$model"
+  if [ -z "$eff" ] && [ "$inherit" = 1 ]; then
+    eff="$(jq -r '.model // ""' "${FLEET_SETTINGS:-$HOME/.claude/settings.json}" 2>/dev/null || true)"
+  fi
+  lc="$(printf '%s' "$eff" | tr '[:upper:]' '[:lower:]')"
+  lname="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  case "$lc" in
+    *opus*|*fable*) ;;
+    *) return 0 ;;
+  esac
+  if [ "$lname" = "hub" ]; then return 0; fi
+  if [ -z "$reason" ]; then
+    echo "spawn: refused — '$eff' is top tier and '$name' is not the Hub. Lanes run sonnet;" \
+         "Opus is by exception. Re-run with -m sonnet, or add --top-tier \"<reason>\" (logged to" \
+         "hub/model-escalations.log). For one hard problem, prefer ONE Opus subagent over promoting the lane." >&2
+    return 1
+  fi
+  log="${FLEET_ESCALATION_LOG:-$HOME/.claude/hub/model-escalations.log}"
+  mkdir -p "$(dirname "$log")"
+  printf '%s spawn name=%s model=%s reason=%s\n' "$(date '+%Y-%m-%d %H:%M %Z')" "$name" "$eff" "$(printf '%s' "$reason" | tr '\n' ' ')" >> "$log"
   return 0
 }
