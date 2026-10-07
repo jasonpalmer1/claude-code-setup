@@ -21,7 +21,7 @@ Turn budget: you have roughly 115 tool calls. At about 80, or when told "TURN CA
 
 Write the report file named on the first line of your brief BEFORE your last tool call, with proof (command output, commit hashes), not claims.
 
-Build and test worktrees and scratch go under `$CLAUDE_BUILD_ROOT` when that env var is set (an external build drive), never the root disk; if it is empty or unset, use normal paths. Remove your worktree when done.
+Build and test worktrees and scratch for <product-a>/HQ go on the USB, never the root disk (L-1682): `W=$(~/.claude/hub/bin/jp-build-root ws-wt)` for worktrees (`git worktree add $W/<name>`), `$(~/.claude/hub/bin/jp-build-root scratch)` for scratch. The helper falls back to the old path with a loud log line if the drive is unmounted; never hardcode `~/projects/<product-a>-wt`. Remove your worktree when done.
 
 If the Write tool refuses the report file (message: "Subagents should return findings as text, not write report files", L-0452), write it with Bash instead: cat > <path> <<'EOF' ... EOF. The report-gate only checks that the file exists on disk, so this satisfies it.
 
@@ -33,4 +33,3 @@ If the Write tool refuses the report file (message: "Subagents should return fin
 5. List the project `CLAUDE.md` traps your diff touches (sw.js CACHE bump, marker guards, etc.) and say how each was handled.
 6. Read the 8 gate checks in `hub/briefs/TEMPLATE-builder.md` against your own diff before handing off. Never run `next build` / `npm test` in <product-a> trees.
 7. Shell shape (the operator 10/06, phone prompts): put multi-step test/repro commands in a script file and run it as one `zsh <file>` call; no wildcard `rm`, no `git add -A`, no top-level `cd ... &&` chains.
-8. Test-file rule (L-1779, the operator J4 yes 10/06): <product-a> tests are per feature area, not per slice. Add assertions as a section under `scripts/suites/<area>/` and run `npx tsx scripts/test-suite-<area>.mts --only <section>` (until the harness lands, extend the nearest existing `scripts/test-*.mts`). A NEW `scripts/test-*.mts` needs `// @new-suite-reason: <why no suite fits>` on line 1 or `test-no-build-marker-guard` fails. Never assert a version, sha, live count, or a date that rolls off a window; derive it from the same input the code uses or use a fixed fixture. Your test must fail against a mutant of your own change; name the mutant in the report.

@@ -5,6 +5,87 @@ can't-happen layer for the catastrophic class. TIGHT patterns only: a false posi
 here costs more trust than it saves. Exit 2 = block. Never blocks on its own failure."""
 import json, sys, re, os, subprocess, time, shlex
 
+# L-1748 (2026-10-06, the operator "Yes"): the guard runs unchanged, but its log is quiet. It writes a line
+# only when it BLOCKS (every sys.exit(2) below) plus ONE summary line per day with that day's run
+# count (proof it is on). Fail-open errors are counted in the summary, not logged one by one. Per-day
+# counters are 1-byte appends under hub/state (atomic, no read-modify-write). Restore the old
+# per-event FAIL-OPEN lines: set SAFETY_GUARD_LOG_FAILOPEN=1. Every counter step is best-effort.
+_SG_LOG = os.path.expanduser("~/.claude/hub/safety-guard.log")
+_SG_STATE = os.path.expanduser("~/.claude/hub/state")
+_SG_CTX = {"tool": ""}
+
+
+def _sg_day(t=None):
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def _sg_count(kind):
+    """Append one byte to today's <kind> counter; returns True if it was the day's first byte."""
+    try:
+        os.makedirs(_SG_STATE, exist_ok=True)
+        f = os.path.join(_SG_STATE, "safety-guard-%s-%s" % (kind, _sg_day()))
+        first = not os.path.exists(f)
+        fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, b"x")
+        finally:
+            os.close(fd)
+        return first
+    except Exception:
+        return False
+
+
+def _sg_size(kind, day):
+    try:
+        return os.path.getsize(os.path.join(_SG_STATE, "safety-guard-%s-%s" % (kind, day)))
+    except Exception:
+        return 0
+
+
+def _sg_daily_summary():
+    """On the first run of a new UTC day, write one summary line for the latest earlier day, prune old counters."""
+    try:
+        today = _sg_day()
+        days = sorted({n.rsplit("-", 3)[-3] + "-" + n.rsplit("-", 3)[-2] + "-" + n.rsplit("-", 3)[-1]
+                       for n in os.listdir(_SG_STATE) if n.startswith("safety-guard-runs-") or n.startswith("safety-guard-failopen-")})
+        prev = [d for d in days if d < today]
+        if prev:
+            d = prev[-1]
+            os.makedirs(os.path.dirname(_SG_LOG), exist_ok=True)
+            with open(_SG_LOG, "a") as fh:
+                fh.write("%sT00:00:00Z DAILY-SUMMARY date=%s runs=%d failopen=%d\n" % (d, d, _sg_size("runs", d), _sg_size("failopen", d)))
+            for d in prev:
+                for k in ("runs", "failopen"):
+                    try:
+                        os.remove(os.path.join(_SG_STATE, "safety-guard-%s-%s" % (k, d)))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+
+def _sg_log_block():
+    try:
+        os.makedirs(os.path.dirname(_SG_LOG), exist_ok=True)
+        with open(_SG_LOG, "a") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " BLOCK tool=%s\n" % (_SG_CTX["tool"] or "?"))
+    except Exception:
+        pass
+
+
+_sg_orig_exit = sys.exit
+
+
+def _sg_exit(code=0):
+    if code == 2:
+        _sg_log_block()
+    _sg_orig_exit(code)
+
+
+sys.exit = _sg_exit
+if _sg_count("runs"):
+    _sg_daily_summary()
+
 _FIRMLINK_PREFIX = "/System/Volumes/Data"
 
 
@@ -1164,6 +1245,9 @@ FAILOPEN_LOG = os.path.expanduser("~/.claude/hub/safety-guard.log")
 
 def _log_failopen(e):
     try:
+        if os.environ.get("SAFETY_GUARD_LOG_FAILOPEN") != "1":
+            _sg_count("failopen")
+            return
         os.makedirs(os.path.dirname(FAILOPEN_LOG), exist_ok=True)
         with open(FAILOPEN_LOG, "a") as fh:
             fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1388,6 +1472,7 @@ def _note(line):
 try:
     data = json.load(sys.stdin)
     name = data.get("tool_name", "")
+    _SG_CTX["tool"] = str(name)[:40]
     tin = data.get("tool_input") or {}
     if name == "Bash":
         cmd_raw = tin.get("command", "")
