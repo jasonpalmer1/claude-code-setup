@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""hub-who — one-line proof of who currently holds the single-hub lease
+(L-0911). Read-only, no args needed, safe for anyone (the operator, a stranger, a
+hook, another chat) to run any number of times.
+
+Output (exactly one line, plan section 3 item 3):
+  HUB: Hub [xxxxxx] (cwd <path>, pid <n>) — heartbeat <age> ago — ALIVE|SUSPECT|DEAD
+  HUB: none
+
+Exit code: 0 if a live holder exists (ALIVE or SUSPECT), 1 otherwise (NONE
+or DEAD) — a DEAD lease still names the prior holder but is not "live" for
+this exit code's purposes.
+
+Done-test (plan section 3, item 3): a stranger with no lease present gets
+exactly one line, exit 1 (no live holder). Also see hub_lease_lib.status()
+for the "HUB: none" done-test named in the plan.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hub_lease_lib as hl  # noqa: E402
+
+
+def main() -> int:
+    try:
+        lease = hl.read_lease()
+        v, age = hl.verdict(lease)
+        print(hl.proof_line(lease, v, age))
+        return 0 if v in ("ALIVE", "SUSPECT") else 1
+    except Exception as e:
+        # Fail open in the "no proof" direction, never crash.
+        print("HUB: none")
+        print(f"(hub-who errored: {type(e).__name__}: {e})", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

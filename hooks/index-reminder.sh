@@ -1,5 +1,5 @@
 #!/bin/sh
-# PostToolUse hook (Write|Edit): if a file under ~/projects/<name> or ~/trading was
+# PostToolUse hook (Write|Edit): if a file under ~/projects/<name> or ~/research was
 # edited and that project root has no CLAUDE.md, nudge Claude to run /index.
 # Exit 2 feeds the message back to Claude as automated context.
 
@@ -11,8 +11,8 @@ except Exception: print('')" 2>/dev/null)
 [ -z "$fp" ] && exit 0
 
 case "$fp" in
-  "$HOME/trading/"*)
-    root="$HOME/trading" ;;
+  "$HOME/research/"*)
+    root="$HOME/research" ;;
   "$HOME/projects/"*)
     rest=${fp#"$HOME"/projects/}
     name=${rest%%/*}

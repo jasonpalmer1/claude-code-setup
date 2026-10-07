@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""weekly-process-review (L-1780). OPERATOR.md "Weekly process review".
+Collects 7-day process numbers, applies deterministic rules, writes hub/state/weekly-review-<date>.json + .md,
+and (only with --post) files one HQ Decisions card per recommendation via ask-operator (cap 5/week).
+Default is DRY RUN: no cards. No model call unless --llm (one `claude -p --model sonnet`, reads ONLY the json,
+<=3 extra recs; roughly 3-6k input + 1k output tokens, about $0.03-0.05 per run). Missing source => "unknown", never 0.
+Source paths are env-overridable (WPR_*), used by test-weekly-process-review.sh.
+"""
+import argparse, glob, json, os, re, statistics, subprocess, sys
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+HUB = os.environ.get("WPR_HUB", os.path.join(HOME, ".claude", "hub"))
+SRC = {
+    "tests": os.environ.get("WPR_TESTS_GLOB", os.path.join(HUB, "nightly-tmp", "test-results-*.json")),
+    "logs": os.environ.get("WPR_LOGS_GLOB", os.path.join(HUB, "nightly-*.log")),
+    "sched": os.environ.get("WPR_SCHED", os.path.join(HUB, "admin", "sched-fail-state.json")),
+    "disk": os.environ.get("WPR_DISK_LOG", os.path.join(HUB, "disk-guard.log")),
+    "lanes": os.environ.get("WPR_LANES_GLOB", os.path.join(HUB, "locks", "lanes", "*", "breaker.json")),
+    "tokens": os.environ.get("WPR_TOKEN_LEDGER", os.path.join(HOME, ".claude", "projects", "<home-slug>", "memory", "token_ledger.md")),
+}
+OUT = os.environ.get("WPR_OUT", os.path.join(HUB, "state"))
+ASK = os.environ.get("WPR_ASK_CMD", os.path.join(HUB, "bin", "ask-operator"))
+TOK_PER_MIN = 1200   # ASSUMPTION: agent/hub polling+status tokens burned per minute of waiting on a slow step
+REWORK_MIN = 20      # ASSUMPTION: minutes of rework per ticket that fails its first gate
+UNKNOWN = "unknown"
+
+
+def ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def jload(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+MALFORMED = {"n": 0}
+BROKEN_FRAC = 0.5   # a run where more than this share of files failed is a run-level failure, not per-test red
+
+
+def good_row(r):
+    """Row must be a dict with a string file, string status, numeric ms. Anything else is counted and skipped."""
+    ok = (isinstance(r, dict) and isinstance(r.get("file"), str) and isinstance(r.get("status"), str)
+          and isinstance(r.get("ms"), (int, float)) and not isinstance(r.get("ms"), bool))
+    if not ok:
+        MALFORMED["n"] += 1
+    return ok
+
+
+def collect_tests(now):
+    runs = []
+    for p in glob.glob(SRC["tests"]):
+        d = jload(p)
+        t = ts(d.get("generatedAt", "")) if isinstance(d, dict) and isinstance(d.get("generatedAt"), str) else None
+        if t and isinstance(d.get("rows"), list):
+            runs.append((t, [r for r in d["rows"] if good_row(r)]))
+    if not runs:
+        return {"status": UNKNOWN, "why": "no test-results files found"}
+    def window(lo, hi):
+        rs = [r for r in runs if now - timedelta(days=hi) <= r[0] < now - timedelta(days=lo)]
+        if not rs:
+            return None
+        big = max(len(r[1]) for r in rs)
+        rs = [r for r in rs if len(r[1]) >= 0.8 * big]  # drop partial reruns/subset runs (real data has 1-80 row runs)
+        broken = [r for r in rs if r[1] and sum(1 for x in r[1] if x["status"] == "fail") > BROKEN_FRAC * len(r[1])]
+        rs = [r for r in rs if r not in broken]
+        if not rs:
+            return None
+        per = {}
+        for _, rows in rs:
+            for r in rows:
+                per.setdefault(r.get("file"), []).append(r)
+        med = {f: statistics.median([x["ms"] for x in v]) for f, v in per.items()}
+        return {"broken": broken, "runs": len(rs), "file_count": big, "suite_ms_sum_of_medians": int(sum(med.values())), "median_ms": med, "per": per, "rows_by_run": rs}
+    cur, prev = window(0, 7), window(7, 14)
+    if cur is None:
+        return {"status": UNKNOWN, "why": "no usable runs in last 7 days"}
+    out = {"status": "ok" if cur else UNKNOWN}
+    if not cur:
+        out["why"] = "no runs in last 7 days"
+        return out
+    red = {}
+    days = set()
+    for t, rows in cur["rows_by_run"]:
+        days.add(t.date().isoformat())
+        for r in rows:  # only status == "fail" is red; "skipped" is not
+            if r["status"] == "fail":
+                red.setdefault(r["file"], set()).add(t.date().isoformat())
+    broken = [{"at": t.isoformat(), "failed": sum(1 for x in rows if x["status"] == "fail"), "of": len(rows),
+               "ms": sum(x["ms"] for x in rows)} for t, rows in cur["broken"]]
+    out.update(runs=cur["runs"], file_count=cur["file_count"], suite_ms=cur["suite_ms_sum_of_medians"],
+               prev_file_count=prev["file_count"] if prev else UNKNOWN, prev_suite_ms=prev["suite_ms_sum_of_medians"] if prev else UNKNOWN,
+               red_nights={f: len(d) for f, d in red.items()}, red_window_days=len(days), broken_runs=broken, median_ms=cur["median_ms"])
+    return out
+
+
+def collect_deploys(now):
+    rel, phase = [], []
+    files = glob.glob(SRC["logs"])
+    if not files:
+        return {"status": UNKNOWN, "why": "no ws logs found"}
+    seen = set()
+    for p in files:
+        try:
+            lines = open(p, errors="replace").read().splitlines()
+        except Exception:
+            continue
+        for ln in lines:
+            if "RELEASE-CLOCK" in ln or "PHASE-CLOCK" in ln:
+                m = re.search(r"minutes=([0-9.]+)", ln); s = re.search(r"start=(\S+)", ln)
+                t = ts(s.group(1)) if s else None
+                key = ln.strip()
+                if not m or key in seen:
+                    continue
+                seen.add(key)
+                if t and now - timedelta(days=7) <= t <= now:
+                    (rel if "RELEASE-CLOCK" in ln else phase).append(float(m.group(1)))
+    return {"status": "ok" if (rel or phase) else UNKNOWN, "release_minutes": rel, "phase_clock_lines": len(phase),
+            **({} if (rel or phase) else {"why": "no RELEASE-CLOCK/PHASE-CLOCK lines dated in last 7 days"})}
+
+
+def collect_sched():
+    d = jload(SRC["sched"])
+    if not isinstance(d, dict):
+        return {"status": UNKNOWN, "why": "sched-fail-state.json missing/unreadable"}
+    bad = {k: v for k, v in d.items() if isinstance(v, dict) and str(v.get("status")) not in ("0", "ok") and isinstance(v.get("streak"), int) and v.get("streak") > 0}
+    d = {k: v for k, v in d.items()}
+    return {"status": "ok", "note": "current state, not windowed", "failing": {k: {"streak": v.get("streak"), "runs": v.get("runs")} for k, v in bad.items()}}
+
+
+def collect_disk(now):
+    try:
+        lines = open(SRC["disk"], errors="replace").read().splitlines()
+    except Exception:
+        return {"status": UNKNOWN, "why": "disk-guard.log missing"}
+    vals = []
+    for ln in lines:
+        m = re.match(r"(\S+) disk-guard: (\d+)Gi free", ln)
+        t = ts(m.group(1) + "+00:00") if m else None  # log is local time; 1-day skew is immaterial for a 7d window
+        if m and t and t >= now - timedelta(days=8):
+            vals.append(int(m.group(2)))
+    return {"status": "ok", "min_free_gi": min(vals), "samples": len(vals)} if vals else {"status": UNKNOWN, "why": "no disk samples in 7 days"}
+
+
+def collect_gate(now):
+    first = {}
+    for p in glob.glob(SRC["lanes"]):
+        d = jload(p)
+        for h in (d or {}).get("history", []) if isinstance(d, dict) and isinstance(d.get("history"), list) else []:
+            if not isinstance(h, dict) or not isinstance(h.get("ts"), str):
+                MALFORMED["n"] += 1
+                continue
+            t = ts(h.get("ts", ""))
+            if t and now - timedelta(days=7) <= t <= now:
+                key = (h.get("ticket"), h.get("gate"))
+                if key not in first or t < first[key][0]:
+                    first[key] = (t, str(h.get("result", "")).upper())
+    if not first:
+        return {"status": UNKNOWN, "why": "no gate history in 7 days"}
+    ok = sum(1 for _, r in first.values() if r.startswith("PASS"))
+    return {"status": "ok", "gated": len(first), "first_pass": ok, "rate_pct": round(100.0 * ok / len(first), 1)}
+
+
+def collect_tokens(now):
+    try:
+        txt = open(SRC["tokens"], errors="replace").read()
+    except Exception:
+        return {"status": UNKNOWN, "why": "token_ledger.md missing"}
+    usd = 0.0; n = 0; lo = (now - timedelta(days=7)).date().isoformat()
+    for ln in txt.splitlines():
+        m = re.match(r"\|\s*(\d{4}-\d\d-\d\d)\s*\|.*?\|\s*\$([0-9,.]+)\s*\|", ln)
+        if m and m.group(1) >= lo:
+            v = float(m.group(2).replace(",", ""))
+            if v < 500:  # a single fleet-parent row dwarfs the rest; excluded from the sum, noted below
+                usd += v; n += 1
+    return {"status": "ok", "tokens_per_ticket": UNKNOWN, "why_tokens_per_ticket": "ledger rows are per-session with no ticket key",
+            "sessions_7d": n, "usd_7d_excl_fleet_parent": round(usd, 2)}
+
+
+def rec(rid, title, evidence, minutes, method, proof, nowpart=""):
+    m = round(minutes, 1)
+    return {"id": rid, "title": title, "evidence": evidence, "minutes_saved_per_week": m,
+            "tokens_saved_est": int(m * TOK_PER_MIN), "method": method, "quality_proof_required": proof}
+
+
+def rules(d):
+    R = []
+    t = d["tests"]
+    if t["status"] == "ok":
+        pf = t["prev_file_count"]
+        if isinstance(pf, int) and pf and t["file_count"] > pf * 1.05:
+            grow = t["file_count"] - pf
+            avg = t["suite_ms"] / max(t["file_count"], 1)
+            R.append(rec("test-growth", "Test file count grew %d%% week over week" % round(100.0 * grow / pf),
+                         "%d files vs %d last week; suite %.1f min per run" % (t["file_count"], pf, t["suite_ms"] / 60000.0),
+                         grow * avg * 7 / 60000.0, "Merge or retire the %d newest redundant files; saved = growth x avg file ms x 7 nightly runs" % grow,
+                         "Mutation check: the retained tests still fail on the same seeded bugs"))
+        for b in t.get("broken_runs", []):
+            tag = re.sub(r"\W+", "-", b["at"])[:19]
+            R.append(rec("broken-run-" + tag, "Test run at %s failed %d of %d files (run-level failure)" % (b["at"][:16], b["failed"], b["of"]),
+                         "more than half the files failed in one run, so it is treated as a broken run (environment/build), not %d separate test failures; "
+                         "excluded from every per-test count; run took %.1f min" % (b["failed"], b["ms"] / 60000.0),
+                         max(b["ms"] / 60000.0, 1.0), "Find what broke the whole run and add a guard that stops it earlier; saved = that run's minutes",
+                         "Next 7 nights have no run with more than half the files failing"))
+        for f, n in sorted(t["red_nights"].items()):
+            if n >= 3:
+                ms = t["median_ms"].get(f, 0)
+                R.append(rec("red-" + re.sub(r"\W+", "-", f)[:40], "%s failed on %d of last %d nights" % (f, n, t["red_window_days"]),
+                             "counted: runs in the last 7 days with status fail (skipped is not counted, broken whole-suite runs excluded): "
+                             "failed on %d of last %d nights that had a run; median %.0f s per run" % (n, t["red_window_days"], ms / 1000.0),
+                             max(ms * 7 / 60000.0, 1.0), "Fix or quarantine; saved = its runtime x 7 nights plus retry/triage time (floor 1 min)",
+                             "Test goes green 3 nights straight, or is replaced by a check that still catches the bug it guarded"))
+    dp = d["deploys"]
+    if dp["status"] == "ok":
+        over = [m for m in dp["release_minutes"] if m > 15]
+        if over:
+            R.append(rec("slow-deploy", "%d deploy(s) over 15 minutes" % len(over),
+                         "release times (min): %s" % ", ".join("%.1f" % m for m in dp["release_minutes"]),
+                         sum(m - 15 for m in over), "Trim the slowest phase to the 15 min budget; saved = minutes over 15 summed",
+                         "Smoke tests pass on the faster build; same files by hash"))
+    g = d["gate"]
+    if g["status"] == "ok" and g["rate_pct"] < 70:
+        bad = g["gated"] - g["first_pass"]
+        R.append(rec("gate-first-pass", "Gate first-pass rate %.0f%% (under 70%%)" % g["rate_pct"],
+                     "%d of %d gates passed first try; saving assumes ~%d min rework per failed first gate (an assumption, not measured)" % (g["first_pass"], g["gated"], REWORK_MIN), bad * REWORK_MIN,
+                     "Tighten builder self-gate; saved = failed first passes x %d min assumed rework" % REWORK_MIN,
+                     "Next week's first-pass rate is 70%+ with no drop in bug-gate catches"))
+    ds = d["disk"]
+    if ds["status"] == "ok" and ds["min_free_gi"] < 25:
+        R.append(rec("disk-low", "Disk free dipped to %d Gi (under 25)" % ds["min_free_gi"],
+                     "%d samples this week; minimum %d Gi" % (ds["samples"], ds["min_free_gi"]), 15.0,
+                     "Sweep regenerable worktrees/caches earlier; saved = about 15 min per blocked-build incident (assumption)",
+                     "Disk minimum stays above 25 Gi for a full week"))
+    sc = d["sched"]
+    if sc["status"] == "ok":
+        for k, v in sorted(sc["failing"].items()):
+            if v.get("streak") >= 3:
+                R.append(rec("sched-" + re.sub(r"\W+", "-", k)[-40:], "%s failing %s runs in a row" % (k, v["streak"]),
+                             "streak %s of %s total runs" % (v["streak"], v["runs"]), 10.0,
+                             "Root-cause or retire the job; saved = about 10 min/week of alarm triage (assumption)",
+                             "Job runs green 3 times in a row"))
+    return sorted(R, key=lambda r: -r["minutes_saved_per_week"])
+
+
+def llm_recs(data):
+    prompt = ("You read ONLY this JSON of weekly process numbers. Propose up to 3 additional cuts or improvements NOT already in "
+              "'recommendations'. Reply with ONLY a JSON list of objects with keys id,title,evidence,minutes_saved_per_week,tokens_saved_est,method,quality_proof_required. "
+              "Use only numbers present in the JSON; if nothing is supported by the data return [].\n" + json.dumps(data))
+    try:
+        r = subprocess.run(["claude", "-p", "--model", "sonnet", "--output-format", "text"], input=prompt, capture_output=True, text=True, timeout=180)
+        m = re.search(r"\[.*\]", r.stdout, re.S)
+        out = json.loads(m.group(0)) if m else []
+        keys = {"id", "title", "evidence", "minutes_saved_per_week", "tokens_saved_est", "method", "quality_proof_required"}
+        return [dict((k, x[k]) for k in keys) for x in out[:3] if isinstance(x, dict) and keys <= set(x)]
+    except Exception as e:
+        print("weekly-process-review: llm step skipped (%s)" % e, file=sys.stderr)
+        return []
+
+
+def safe(fn, *args):
+    try:
+        return fn(*args)
+    except Exception as e:  # wrong-shape data must never crash the run
+        return {"status": UNKNOWN, "why": "parse error (%s: %s)" % (type(e).__name__, e)}
+
+
+STATE_NAME = "weekly-review-cards.json"
+REPEAT_WEEKS = 4      # a card posted within this many ISO weeks is not reposted ...
+WORSE_PCT = 25        # ... unless its number got more than this much worse
+
+
+def iso_week(now):
+    y, w, _ = now.isocalendar()
+    return "%d-W%02d" % (y, w), y * 53 + w
+
+
+def decide(recs, state, wk, wkn):
+    """Return (to_card, suppressed). state maps rec id -> {week, wk_n, minutes, card_id}."""
+    keep, sup = [], []
+    for r in recs:
+        prev = state.get(r["id"])
+        if prev:
+            age = wkn - prev["wk_n"]
+            if age == 0:
+                sup.append((r["id"], "already carded this week (%s)" % prev["week"])); continue
+            if age < REPEAT_WEEKS:
+                if prev["minutes"] and r["minutes_saved_per_week"] > prev["minutes"] * (1 + WORSE_PCT / 100.0):
+                    r["worse_note"] = ("Reposted: this got more than %d%% worse since the %s card (%s to %s minutes per week)."
+                                       % (WORSE_PCT, prev["week"], prev["minutes"], r["minutes_saved_per_week"]))
+                else:
+                    sup.append((r["id"], "card from %s still open or declined, not reposted for %d weeks" % (prev["week"], REPEAT_WEEKS))); continue
+        keep.append(r)
+    return keep, sup
+
+
+def card(date, r):
+    ctx = (r.get("worse_note", "") + " " if r.get("worse_note") else "") + ("%s. Evidence: %s. Proposed change: %s. Estimated saving: %s minutes per week and about %s tokens per week "
+           "(token figure is an estimate at %d tokens per waiting minute). Nothing changes unless you approve, and approval "
+           "requires this proof first: %s.") % (r["title"], r["evidence"], r["method"], r["minutes_saved_per_week"], r["tokens_saved_est"], TOK_PER_MIN, r["quality_proof_required"])
+    return ["add", "--ticket", "L-1780", "--header", ("Weekly review: " + r["title"])[:80], "--context", ctx,
+            "--option", "Approve|Build the change and prove quality holds before it lands",
+            "--option", "Decline|Leave the process as it is", "--recommended", "0", "--id", "wr-%s-%s" % (date, r["id"])]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--post", action="store_true", help="file Decisions cards (default is dry run: no cards)")
+    ap.add_argument("--llm", action="store_true", help="one sonnet call for up to 3 extra recs (off by default; costs tokens)")
+    ap.add_argument("--now", default="", help="ISO time override (tests)")
+    ap.add_argument("--cap", type=int, default=5)
+    a = ap.parse_args(argv)
+    now = ts(a.now) if a.now else datetime.now(timezone.utc)
+    date, wkn = iso_week(now)
+    data = {"generated": now.isoformat(), "window_days": 7, "tests": safe(collect_tests, now), "deploys": safe(collect_deploys, now),
+            "sched": safe(collect_sched), "disk": safe(collect_disk, now), "gate": safe(collect_gate, now), "tokens": safe(collect_tokens, now)}
+    data["malformed_rows_skipped"] = MALFORMED["n"]
+    recs = rules(data)
+    spath = os.path.join(OUT, STATE_NAME)
+    state = jload(spath)
+    state = state if isinstance(state, dict) else {}
+    state = {k: v for k, v in state.items() if isinstance(v, dict) and isinstance(v.get("wk_n"), int)}
+    recs, suppressed = decide(recs, state, date, wkn)
+    data["suppressed_repeat"] = suppressed
+    data["tests"].pop("median_ms", None)
+    data["recommendations"] = recs
+    if a.llm:
+        data["recommendations"] = recs + llm_recs(data)
+    allr = data["recommendations"]
+    already = sum(1 for v in state.values() if v.get("wk_n") == wkn)  # cards already filed this ISO week count against the cap
+    data["cards_already_this_week"] = already
+    posted = allr[:max(a.cap - already, 0)]; data["overflow_not_carded"] = [r["id"] for r in allr[len(posted):]]
+    data["mode"] = "post" if a.post else "dry-run"
+    data["cards"] = []
+    os.makedirs(OUT, exist_ok=True)
+    if a.post:
+        for r in posted:
+            p = subprocess.run([ASK] + card(date, r), capture_output=True, text=True)
+            data["cards"].append({"id": r["id"], "rc": p.returncode, "out": (p.stdout or p.stderr).strip()[:200]})
+            if p.returncode == 0:
+                state[r["id"]] = {"week": date, "wk_n": wkn, "minutes": r["minutes_saved_per_week"], "card_id": "wr-%s-%s" % (date, r["id"])}
+        with open(spath, "w") as f:
+            json.dump(state, f, indent=1)
+    md = ["# Weekly process review %s (%s)" % (date, data["mode"]), ""]
+    def line(n, d, f):
+        md.append("- %s: %s" % (n, f(d) if d.get("status") == "ok" else "%s (%s)" % (UNKNOWN, d.get("why", "?"))))
+    line("Tests", data["tests"], lambda d: "%s files, suite %.1f min/run (last week: %s files)" % (d["file_count"], d["suite_ms"] / 60000.0, d["prev_file_count"]))
+    line("Deploys", data["deploys"], lambda d: "release minutes %s" % d["release_minutes"])
+    line("Scheduled-job failures", data["sched"], lambda d: "%d failing now %s" % (len(d["failing"]), d["failing"]))
+    line("Disk", data["disk"], lambda d: "min %s Gi free" % d["min_free_gi"])
+    line("Gate first-pass", data["gate"], lambda d: "%s%% (%s/%s)" % (d["rate_pct"], d["first_pass"], d["gated"]))
+    line("Tokens", data["tokens"], lambda d: "tokens per ticket: %s (%s); $%s over %s sessions" % (d["tokens_per_ticket"], d["why_tokens_per_ticket"], d["usd_7d_excl_fleet_parent"], d["sessions_7d"]))
+    md.append("- Data quality: %d malformed rows skipped" % MALFORMED["n"])
+    md += ["- Repeat suppression: %s" % ("; ".join("%s (%s)" % x for x in suppressed) if suppressed else "none")]
+    md += ["", "## Recommendations (%d, %d carded, cap %d)" % (len(allr), len(posted), a.cap)]
+    md += ["%d. %s: ~%s min/week, ~%s tokens (est). %s" % (i + 1, r["title"], r["minutes_saved_per_week"], r["tokens_saved_est"], r["method"]) for i, r in enumerate(allr)] or ["None. No rule fired."]
+    with open(os.path.join(OUT, "weekly-review-%s.json" % date), "w") as f:
+        json.dump(data, f, indent=1, default=str)
+    with open(os.path.join(OUT, "weekly-review-%s.md" % date), "w") as f:
+        f.write("\n".join(md) + "\n")
+    print("\n".join(md))
+    print("cards: %s" % (json.dumps(data["cards"]) if a.post else "none (dry run)"))
+    return 1 if any(c["rc"] for c in data["cards"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

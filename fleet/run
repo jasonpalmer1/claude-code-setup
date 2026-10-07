@@ -45,7 +45,7 @@ echo "── fleet: $FLEET_NAME ── $FLEET_DIR  (depth $CLAUDE_FLEET_DEPTH, p
 
 args=()
 [ -n "$FLEET_MODEL" ] && args+=(--model "$FLEET_MODEL")
-[ "${FLEET_AUTO:-0}" = 1 ] && args+=(--permission-mode acceptEdits)
+[ "${FLEET_AUTO:-0}" = 1 ] && args+=(--dangerously-skip-permissions --permission-mode bypassPermissions)  # the operator 2026-10-05: new chats skip permissions
 [ "${FLEET_RC:-0}" = 1 ] && args+=(--remote-control "$FLEET_NAME")
 [ -n "$FLEET_PROMPT" ] && args+=("$FLEET_PROMPT")
 

@@ -7,7 +7,7 @@ Show the operator the state of his whole fleet in one table so he can decide wha
 
 **READ-ONLY — hard rule.** This command *only reports*. It must **never** modify any repo: no `add`, `commit`, `push`, `pull`, `fetch`, `checkout`, `stash`, or anything that touches working trees or remotes. Pure inspection. If you think a repo needs action, *suggest* it in the table — don't do it (use `/ship` etc. yourself).
 
-Source of truth for what's active vs archived: `~/projects/CONVENTIONS.md`. Scan only git repos directly under `~/projects/`; **skip non-git dirs** and **skip `~/trading` entirely** (archived).
+Source of truth for what's active vs archived: `~/projects/CONVENTIONS.md`. Scan only git repos directly under `~/projects/`; **skip non-git dirs** and **skip `~/research` entirely** (archived).
 
 **Delegable.** The scan is mechanical, cheap, and self-contained — hand it to a **Haiku subagent** and have it return only the gathered rows. Opus just infers the next-action column and formats the table.
 
@@ -31,13 +31,13 @@ Steps:
    `git rev-list --left-right --count @{u}...HEAD` prints `behind<TAB>ahead`. When there's no upstream the command errors → treat as **no-upstream** and say so gracefully (don't show a bogus 0/0).
 
 2. **Infer one suggested next action per project** — terse, imperative, and **DEPLOY-AWARE**. Deploy models differ (see the `reference_deploy_mechanisms` memory / `~/projects/CONVENTIONS.md`):
-   - **our-place** — git push is neutral; deploy is the explicit `/ship` step.
+   - **my-app** — git push is neutral; deploy is the explicit `/ship` step.
    - **<product-a> and <product-b>** — approved laptop scripts deploy from their designated checkout; scheduled jobs consume origin/main, so a push may ship at the next tick. Never describe GitHub Actions as their deployment path. For WIP suggest an isolated branch; for a release follow the current project contract and script.
-   - **<your-domain>** — verify the current deployment contract before recommending any push; do not infer its mechanism from another project.
+   - **<your-domain>-com** — verify the current deployment contract before recommending any push; do not infer its mechanism from another project.
 
    Mapping:
    - uncommitted changes → `commit WIP (N files)` (committing is safe — it does not deploy)
-   - clean + ahead, our-place → `deploy via /ship`
+   - clean + ahead, my-app → `deploy via /ship`
    - clean + ahead, push-to-deploy project → `⚠ push = PROD deploy — use a preview branch unless shipping`
    - clean + behind → `pull`
    - clean + no upstream → `set upstream / push branch (mind deploy trigger)`
