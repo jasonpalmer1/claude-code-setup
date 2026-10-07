@@ -43,7 +43,7 @@ interview me where noted. Never push anything to any git remote.
 5. Show me the commands/ list with one-line descriptions and let me drop any I won't use,
    then install my picks into ~/.claude/commands/. Keep /log, /index, and /tokens — those
    three are the core of the system. Also install agents/ into ~/.claude/agents/ (the
-   plan → build → playtest → bug-gate workflow) and bin/ + fleet/ into ~/.claude/bin/ and
+   plan → build → playtest → bug-gate workflow) and hub/bin/ + fleet/ into ~/.claude/hub/bin/ and
    ~/.claude/fleet/ if I want the hub/peer-session pattern, chmod +x everything in both.
 6. Install hooks/ into ~/.claude/hooks/: chmod +x the shell/Python/JS hooks, replace
    <MEMORY_DIR> and project-root placeholders, and merge the hook wiring from
@@ -79,7 +79,7 @@ earlier one. Never push anything to any git remote.
    ~/.claude/hooks/ into a timestamped backup directory and tell me where it is.
 
 2. Clone the repo to a scratch directory and read its README.md. Then, for every tracked file
-   in the repo (each file under commands/, agents/, bin/, fleet/, hooks/, CLAUDE.md.template,
+   in the repo (each file under commands/, agents/, hub/bin/, fleet/, hooks/, CLAUDE.md.template,
    OPERATOR.md, settings.json.template), classify it against what I already have and show me a
    short table (file / category / note):
    - MISSING — I have no file that corresponds to it. New adopt.
