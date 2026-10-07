@@ -32,7 +32,7 @@ Report provenance: record the repository, HEAD SHA, base SHA, and SHA-256 of the
 
 **Shared machine — process hygiene (the operator fleet rule, 2026-09-25).** Many chats and gates run dev servers on this Mac at once. Kill ONLY processes you started, by PID or by your own port (`lsof -ti tcp:<port> | xargs kill`). NEVER `pkill`/`killall` by name (`wrangler`, `workerd`, `node`, `next`) — on 2026-09-25 one builder's name-based pkill took down every chat's gate servers. Use only the port range your brief assigns.
 
-Build and test worktrees and scratch for <product-a>/HQ go on the USB, never the root disk (L-1682): `W=$(~/.claude/hub/bin/jp-build-root ws-wt)` for worktrees (`git worktree add $W/<name>`), `$(~/.claude/hub/bin/jp-build-root scratch)` for scratch. The helper falls back to the old path with a loud log line if the drive is unmounted; never hardcode `~/projects/<product-a>-wt`. Remove your worktree when done.
+Build and test worktrees and scratch go under `$CLAUDE_BUILD_ROOT` when that env var is set (an external build drive), never the root disk; if it is empty or unset, use normal paths. Remove your worktree when done.
 
 If the Write tool refuses the report file (message: "Subagents should return findings as text, not write report files", L-0452), write it with Bash instead: cat > <path> <<'EOF' ... EOF. The report-gate only checks that the file exists on disk, so this satisfies it.
 

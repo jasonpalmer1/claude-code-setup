@@ -21,7 +21,7 @@ Turn budget: you have roughly 115 tool calls. At about 80, or when told "TURN CA
 
 Write the report file named on the first line of your brief BEFORE your last tool call, with proof (command output, commit hashes), not claims.
 
-Build and test worktrees and scratch for <product-a>/HQ go on the USB, never the root disk (L-1682): `W=$(~/.claude/hub/bin/jp-build-root ws-wt)` for worktrees (`git worktree add $W/<name>`), `$(~/.claude/hub/bin/jp-build-root scratch)` for scratch. The helper falls back to the old path with a loud log line if the drive is unmounted; never hardcode `~/projects/<product-a>-wt`. Remove your worktree when done.
+Build and test worktrees and scratch go under `$CLAUDE_BUILD_ROOT` when that env var is set (an external build drive), never the root disk; if it is empty or unset, use normal paths. Remove your worktree when done.
 
 If the Write tool refuses the report file (message: "Subagents should return findings as text, not write report files", L-0452), write it with Bash instead: cat > <path> <<'EOF' ... EOF. The report-gate only checks that the file exists on disk, so this satisfies it.
 

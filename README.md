@@ -106,7 +106,7 @@ Works on a fresh Mac (macOS, with `git`, `python3`, and [Claude Code](https://cl
    ```
    This copies commands, agents, hooks, the hub tools (`~/.claude/hub/bin`), routines and templates into `~/.claude`, creates empty memory/ledger/board stubs, fills in your own project-dir name in the scripts that need it, and writes three launchd job files (disk check every 10 min, weekly process review on Mondays, weekly token review on Fridays) into `~/Library/LaunchAgents`. It does **not** load them.
 4. **Fill in the contract** (5 min) — open `~/.claude/OPERATOR.md` and `~/.claude/CLAUDE.md`, replace every `<PLACEHOLDER>` (your name, spending cap, red lines). These two files are the whole system's behavior; the scripts only enforce them.
-5. **Turn on the hooks** (1 min) — merge the hook entries from `settings.json.template` into `~/.claude/settings.json` (or let the installer create it on a fresh machine). Start with the safety hooks (`safety-guard.py`, `model-guard.py`, `mcp-guard.py`).
+5. **Hooks are registered for you** (0 min) — the installer registers every hook in `settings.json.template` in your `~/.claude/settings.json`. On a fresh machine it writes the file; if you already have one it **merges additively** (`scripts/merge-settings.py`): it only adds hook commands and permissions that are missing, never changes or removes anything of yours, and saves a timestamped `settings.json.bak-*` first. If your file isn't valid JSON it leaves it alone and tells you to merge by hand. Dry-run first (`./install.sh`) to see exactly which entries would be added. The registered set includes the safety hooks (`safety-guard.py`, `model-guard.py`, `mcp-guard.py`) and the fleet hooks (see below); delete any entry you don't want from `settings.json`.
 6. **Turn on the schedules you want** (1 min)
    ```sh
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude.disk-guard.plist
@@ -131,7 +131,14 @@ Installed to `~/.claude/hub/bin/` so their internal state paths resolve. All are
 | `hub-claim` / `hub-who` | session lease so two chats never silently drive one hub |
 | `hub-log-append` | the sanctioned way to land a session log from a context that cannot edit files |
 
-Extra hooks shipped but **not** registered by default (read each header, then add to `settings.json` if you want it): `turn-cap.py`, `subagent-stop-reap.py`, `session-end-reap.py`, `process-register.py`, `peer-batch.py`, `worker-lessons.py`, `log-staleness-enforcer.py`, `inbox-inject.py`, `ask-question-guard.py`.
+Fleet hooks registered by the template (read each header; delete an entry from `settings.json` to turn one off): `worker-lessons.py`, `log-staleness-enforcer.py` (blocks tool calls once a live session has gone 50 minutes without a `/log`), `peer-batch.py` (queues non-urgent peer messages), `inbox-inject.py`, `ask-question-guard.py`, `process-register.py`, `subagent-stop-reap.py`, `session-end-reap.py`. `turn-cap.py` is not in `settings.json` on purpose: it is wired through the `hooks:` frontmatter of `agents/builder.md`.
+
+### Optional environment variables (all default to empty or disabled)
+
+| Variable | Effect |
+|---|---|
+| `CLAUDE_BUILD_ROOT` | Path of an external build drive. When set, `fleet/spawn` puts lane worktrees under `$CLAUDE_BUILD_ROOT/wt`, and `model-guard.py` skips its root-disk pre-dispatch gate for prompts that already mention that path. Unset means nothing machine-specific happens. |
+| `DISK_GUARD_USB_VOLUME` | Mount point (e.g. `/Volumes/YourDrive`) that `hub/bin/disk-guard` should also report free space for. Unset means it reports only the root disk. |
 
 ## What's here
 
@@ -178,10 +185,7 @@ Extra hooks shipped but **not** registered by default (read each header, then ad
   (correctness check on the exact diff before it ships), and `search-demand.md` (checks real
   search demand before a new page/site). Spawn them with the Agent tool, one task each, model
   stated explicitly every time.
-- **`bin/`** — small CLI helpers the hub/board pattern leans on: a session-lease pair
-  (`hub-claim`/`hub-who`, so two sessions never silently collide on one repo), a `ledger` CLI
-  over the token-ledger data, and `disk-guard` (a threshold check before anything that deletes
-  or frees disk space). Each ships with its own test file — run those after any edit.
+- **`hub/bin/`** — the one canonical home for the CLI helpers (installed to `~/.claude/hub/bin/`; there is no separate `bin/` directory): a session-lease pair (`hub-claim`/`hub-who`, so two sessions never silently collide on one repo), a `ledger` CLI over the token-ledger data, `disk-guard` (a threshold check before anything that deletes or frees disk space), plus `selfcheck`, `lane-lock`, `ask-operator` and `weekly-process-review`. Each ships with its own test file — run those after any edit.
 - **`fleet/`** — `spawn`/`run` plus `lib.sh`: the peer-session pattern from `CLAUDE.md.template`'s
   "Peer sessions" section made concrete — launching a genuinely separate chat identity (not just
   an in-session subagent) for a long-lived, independently-drivable lane of work.
@@ -222,7 +226,7 @@ and never installs anything that pushes on your behalf.
 ### Installing by hand
 
 1. Copy `CLAUDE.md.template` → `~/.claude/CLAUDE.md` and `OPERATOR.md` → `~/.claude/OPERATOR.md`, then fill in the placeholders in both (see "The two-file contract" above).
-2. Copy `commands/`, `agents/`, `bin/`, `fleet/`, and `hooks/` → the matching directories under `~/.claude/`, then `chmod +x` the shell/Python/JS ones. Copy `routines/` too if you want scheduled runs.
+2. Copy `commands/`, `agents/`, `fleet/`, and `hooks/` → the matching directories under `~/.claude/`, and `hub/bin/` → `~/.claude/hub/bin/`, then `chmod +x` the shell/Python/JS ones. Copy `routines/` too if you want scheduled runs.
 3. Copy `settings.json.template` → `~/.claude/settings.json`, editing paths/permissions as needed (or merge just the hook entries from it into a settings.json you already have).
 4. Create your memory directory and an empty `MEMORY.md` index inside it — the path is `~/.claude/projects/<your-home-path-with-slashes-replaced-by-dashes>/memory/`.
 5. Copy `templates/hub-board.md` → `~/.claude/hub/board.md` if you want the One-Chat Hub.
@@ -276,7 +280,7 @@ screenshot-testing binaries (install those separately, same as any other depende
 If you keep your own fork with real customizations, the same idea works as a private git repo:
 mirror it onto the second machine, clone over `~/.claude` (or run `install.sh --merge` from it),
 verify hooks fire with a sample payload, and keep a whitelist-style `.gitignore` — ignore
-everything, opt in `CLAUDE.md`/`OPERATOR.md`/`settings.json`/`commands/`/`agents/`/`bin/`/
+everything, opt in `CLAUDE.md`/`OPERATOR.md`/`settings.json`/`commands/`/`agents/`/`hub/`/
 `fleet/`/`hooks/`/`templates/`/`routines/`/the memory tree explicitly, so caches, transcripts,
 and credentials never get swept in by accident. The one machine-specific thing worth calling
 out: if your harness keys its per-project data directory off the OS username, bridge that with

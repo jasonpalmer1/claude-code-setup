@@ -90,8 +90,12 @@ fi
 
 # L-1682: report the USB build drive's free space next to root. INFORMATION ONLY -- the verdict
 # and exit code above stay root-disk-only. DISK_GUARD_USB_VOLUME overrides (tests).
-USB_VOL=${DISK_GUARD_USB_VOLUME:-/Volumes/UnionSine}
-if [[ -d "$USB_VOL" ]]; then
+# Default is empty = no external drive reported. Set DISK_GUARD_USB_VOLUME=/Volumes/YourDrive to opt in.
+USB_VOL=${DISK_GUARD_USB_VOLUME:-}
+USB_NOTE="no external build drive configured"
+if [[ -z "$USB_VOL" ]]; then
+  :
+elif [[ -d "$USB_VOL" ]]; then
   USB_GI=$(df -g "$USB_VOL" 2>/dev/null | awk 'NR==2{print $4}')
   case "$USB_GI" in
     <->) USB_NOTE="USB build drive: ${USB_GI}Gi free" ;;

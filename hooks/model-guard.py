@@ -405,7 +405,10 @@ try:
             return m
         return None
     build_match = None
-    if tool in ("Agent", "Task") and "/Volumes/UnionSine" not in prompt:
+    # CLAUDE_BUILD_ROOT (empty = disabled): a prompt that already points builds at this external
+    # build root is exempt from the root-disk pre-dispatch gate.
+    _build_root = os.environ.get("CLAUDE_BUILD_ROOT", "")
+    if tool in ("Agent", "Task") and not (_build_root and _build_root in prompt):
         build_match = _first_unnegated_shape(prompt)
     if build_match:
         try:
